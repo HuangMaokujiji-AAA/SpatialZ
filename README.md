@@ -94,6 +94,80 @@ microenvironment scales or radius. In server environments where existing
 package versions must be preserved, do not install `requirements.txt` directly;
 add missing dependencies and verify the relevant computations first.
 
+# 4 MERFISH held-out slice validation
+
+Generate the middle section using **only `0.04` and `0.14`**, then compare it
+with the real held-out section `0.09`:
+
+```bash
+cd /3250608056/code/SpatialZ
+git pull --ff-only origin master
+CUDA_VISIBLE_DEVICES=0 python -u run_merfish_holdout.py --device cuda:0 --mender-jobs 2
+```
+
+Use the existing server Python environment. This command does not install
+packages or change their versions; Conda is not required.
+
+The script uses `alpha=0.5`, seed 42, 1,000 optimization iterations, `lr=1e5`,
+80 optimization projections, `k_sam=50`, `Beta=1`, and two MENDER processes,
+matching the first-pair runner settings. The number of generated cells is the
+integer average of the two **input** counts: 5,707 for the bundled files. The
+real target's 5,557 cells do not determine generation. Target expression,
+coordinates, labels, and cell count are read only after generation has been
+saved. Input expression and coordinates are used as supplied, with no further
+normalization or target-based registration. These are already processed/aligned
+files; this procedure does not establish whether upstream preprocessing used
+information from other sections.
+
+Results are saved in `output/merfish_holdout_009/`:
+
+| File | Content |
+| --- | --- |
+| `generated_009.h5ad` | Synthesized section, marked `data_type=synthetic` |
+| `run.json` | Completion status, generation parameters, file hashes, shapes, runtime |
+| `environment.json` | Installed package versions |
+| `metrics.json` | QC, comparisons against real 0.09, metric definitions and limitations |
+| `comparison_summary.csv` | Generated and endpoint comparison metrics |
+| `gene_comparison.csv` | Gene means, variances, detection fractions and the endpoint-mean baseline |
+| `cell_class_comparison.csv`, `Region_comparison.csv` | Annotation counts and proportions |
+| `expression_by_cell_class.csv` | Expression comparison per cell class; groups below 20 cells flagged |
+| `spatial_comparison.png` | Four sections with identical coordinate limits and cell-class colors |
+| `expression_comparison.png` | Gene means, class proportions and total-expression distributions |
+
+There is no one-to-one cell correspondence. Metrics compare unpaired
+distributions: gene-mean Pearson/Spearman (higher is better), expression MAE/RMSE,
+detection MAE in percentage points, cell-class/region total variation, and
+spatial sliced Wasserstein-1 and symmetric mean nearest-neighbor distance
+(lower is better). Spatial Wasserstein uses 128 shared unit directions with a
+separate seeded RNG and normalizes each slice to unit probability mass. Spatial
+distances retain the supplied coordinate units. Nearest-neighbor distances also
+depend on sampling density and are descriptive, not cell-matching accuracy.
+Constant-vector correlations are saved as JSON `null` rather than misleading
+numbers. Total expression uses the supplied values, not assumed raw UMI counts.
+
+The two endpoints are each compared to real 0.09 as reference distributions.
+The simple expression baseline averages their per-gene means with equal slice
+weights. A high generated gene-mean correlation alone does not establish an
+improvement over this baseline. Inspect spatial error, proportions, per-class
+expression and all-zero cells together. This is one held-out section with one
+seed using the specified runner settings, rather than the complete published
+benchmark.
+
+Existing output directories are never overwritten. To repeat with another seed:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u run_merfish_holdout.py --device cuda:0 --mender-jobs 2 --seed 43 --output output/merfish_holdout_009_seed43
+```
+
+Engineering checks (no GPU or generation dependencies needed):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+These checks test held-out isolation, metric probability normalization and
+artifact creation with a mocked generator; they do not measure method accuracy.
+
 **Reference:** Lin, S., Wang, Z., Cui, Y., Zou, Q., Han, C., Yan, R., … & Yuan, Z. (2024). *Bridging the Dimensional Gap from Planar Spatial Transcriptomics to 3D Cell Atlases*. *bioRxiv*, 2024-12.
 
  
