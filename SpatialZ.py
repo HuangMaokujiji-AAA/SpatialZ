@@ -23,7 +23,8 @@ def Generate_spatialz(adata1, adata2, adata1_id='above', adata2_id='below',
                       alpha=0.5, device='auto', n_cell=None, k_neighbors=1,
                       n_mag=1.0, lr=1e5, nb_iter_max=3000, seed=42,
                       num_projections=80, cell_type_key='cell_type', syn_mode= 'default', k_sam=3, 
-                      micro_env_key='mender', Beta = 100, add_obs_list= None, verbose=True):
+                      micro_env_key='mender', Beta = 100, add_obs_list= None, verbose=True,
+                      mender_n_jobs=2):
     """
     The Generate_spatialz function is designed to integrate spatial coordinates and gene expression from two AnnData objects and generate a new AnnData object. 
 
@@ -50,6 +51,7 @@ def Generate_spatialz(adata1, adata2, adata1_id='above', adata2_id='below',
         Beta = (float): Weight of microenvironment similarity.
         add_obs_list (list of str, optional): Annotation information transferred from the real slices in obs.
         verbose (bool): Controls the verbosity of the output during the function's execution.
+        mender_n_jobs (int): Number of CPU processes used for microenvironment measurement.
     
     Returns:
         A new AnnData object (a intermediate virtual slices) that combines spatial coordinates and gene expression data. 
@@ -200,7 +202,8 @@ def Generate_spatialz(adata1, adata2, adata1_id='above', adata2_id='below',
             print("Begin to calculate micro-environment measurement......")
         start_time = time.time()
         adata1, adata2, adata3 = perform_microenv_measure(adata1, adata2, adata3, cell_type_key, 
-                             scale=6, radius=15, micro_env_key=micro_env_key)    
+                             scale=6, radius=15, micro_env_key=micro_env_key,
+                             n_jobs=mender_n_jobs)
         print_time("Micro-environment measurement", start_time)   
 
         if verbose:
@@ -220,8 +223,10 @@ def Generate_spatialz(adata1, adata2, adata1_id='above', adata2_id='below',
 
 
 def perform_microenv_measure(adata1, adata2, adata3, cell_type_key, 
-                             scale = 6, radius = 15, micro_env_key='mender'):
+                             scale = 6, radius = 15, micro_env_key='mender', n_jobs=2):
     # input parameters of MENDER
+    if not isinstance(n_jobs, int) or n_jobs < 1:
+        raise ValueError("n_jobs must be a positive integer.")
 
     temp_adata_list = [adata1, adata2, adata3]
 
@@ -252,7 +257,7 @@ def perform_microenv_measure(adata1, adata2, adata3, cell_type_key,
     
     # Suppressing output from msm.run_representation_mp
     with contextlib.redirect_stdout(io.StringIO()):
-        msm.run_representation_mp(200)
+        msm.run_representation_mp(n_jobs)
     
     adata_MENDER = msm.adata_MENDER
     temp_adata_all.obsm[micro_env_key] = adata_MENDER.X
@@ -351,7 +356,7 @@ def synthesize_gene_expression_fast(reference_adatas, query_adata, cell_type_key
 def Generate_multiple_spatialz(adata1, adata2, num_sim, adata1_id='above', adata2_id='below',
                                device='auto', n_cell=None, n_mag=1.0, lr=1e5, nb_iter_max=3000, seed=42, num_projections=80,
                                cell_type_key='cell_type',syn_mode= 'default', k_sam=3, micro_env_key = 'mender', Beta = 100, add_obs_list=None, verbose=True,
-                               include_raw=True):
+                               include_raw=True, mender_n_jobs=2):
     """
     The Generate_multiple_spatialz function extends the capabilities of the Generate_spatialz by generating multiple integrated AnnData objects. 
 
@@ -377,6 +382,7 @@ def Generate_multiple_spatialz(adata1, adata2, num_sim, adata1_id='above', adata
         add_obs_list (list of str, optional): Annotation information transferred from the real slices in obs.
         verbose (bool): Controls the verbosity of the output during the function's execution.
         include_raw (bool): Whether to include the original datasets in the final output alongside the synthesized slices. 
+        mender_n_jobs (int): Number of CPU processes used for microenvironment measurement.
 
 
     Returns:
@@ -399,7 +405,8 @@ def Generate_multiple_spatialz(adata1, adata2, num_sim, adata1_id='above', adata
         sim_adata = Generate_spatialz(adata1, adata2, adata1_id=adata1_id, adata2_id=adata2_id,
                                       alpha=alpha, device=device, n_cell=n_cell, n_mag=n_mag, lr=lr,
                                       nb_iter_max=nb_iter_max, seed=seed, num_projections=num_projections,
-                                      cell_type_key=cell_type_key, syn_mode= syn_mode, k_sam=k_sam, micro_env_key = micro_env_key, Beta = Beta, add_obs_list=add_obs_list,verbose=True
+                                      cell_type_key=cell_type_key, syn_mode= syn_mode, k_sam=k_sam, micro_env_key = micro_env_key, Beta = Beta, add_obs_list=add_obs_list,verbose=True,
+                                      mender_n_jobs=mender_n_jobs
                                       )
         # Create slice_id
         #slice_id = f"{adata1_id}-{adata2_id}-{alpha:.2f}"
@@ -428,7 +435,7 @@ def Generate_multiple_spatialz(adata1, adata2, num_sim, adata1_id='above', adata
 def Generate_multiple_slices(adata_list, num_sim_list, adatas_id_list,
                              save_path, device='auto', n_cell=None, n_mag=1.0, lr=1e-5, nb_iter_max=3000, seed=42, 
                              num_projections=80, cell_type_key='cell_type', syn_mode= 'default', k_sam=3, micro_env_key='mender', Beta = 100, add_obs_list=None,
-                             verbose=True, include_raw=True):
+                             verbose=True, include_raw=True, mender_n_jobs=2):
     """
  
     The Generate_multiple_slices function aims to integrate multiple AnnData objects, 
@@ -459,6 +466,7 @@ def Generate_multiple_slices(adata_list, num_sim_list, adatas_id_list,
         add_obs_list (list of str, optional): Annotation information transferred from the real slices in obs.
         verbose (bool): Controls the verbosity of the output during the function's execution.
         include_raw (bool): Whether to include the original datasets in the final output alongside the synthesized slices. 
+        mender_n_jobs (int): Number of CPU processes used for microenvironment measurement.
 
     Returns:
         A concatenated AnnData object that contains: 
@@ -486,7 +494,8 @@ def Generate_multiple_slices(adata_list, num_sim_list, adatas_id_list,
             sim_adata = Generate_spatialz(adata1, adata2, adata1_id=adata1_id, adata2_id=adata2_id,
                                           alpha=alpha, device=device, n_cell=n_cell, n_mag=n_mag, lr=lr,
                                           nb_iter_max=nb_iter_max, seed=seed, num_projections=num_projections,
-                                          cell_type_key=cell_type_key, syn_mode= syn_mode, k_sam=k_sam, micro_env_key=micro_env_key, Beta = Beta, add_obs_list=add_obs_list, verbose=verbose
+                                          cell_type_key=cell_type_key, syn_mode= syn_mode, k_sam=k_sam, micro_env_key=micro_env_key, Beta = Beta, add_obs_list=add_obs_list, verbose=verbose,
+                                          mender_n_jobs=mender_n_jobs
                                           )
             slice_id = f"{adata1_id}-{adata2_id}-{j}"
             sim_adata.obs['slice_id'] = slice_id

@@ -66,6 +66,34 @@ After launching the Docker container, users can access Jupyter Notebook by navig
 `http://server_ip:8888`
 
 
+# 3 First MERFISH interpolation
+
+After preparing the dependencies, run one midpoint interpolation between the
+bundled sections `0.04` and `0.09`:
+
+```bash
+python -u run_merfish_demo.py --device cuda:0 --mender-jobs 2
+```
+
+The script uses both complete sections, 1,000 coordinate optimization iterations,
+`lr=1e5`, 80 projections, and the default microenvironment-based expression
+synthesis with `cell_type_key='cell_class'`, `k_sam=50`, and `Beta=1`.
+It seeds NumPy and PyTorch with 42 and keeps the input expression values and
+spatial coordinates as provided.
+
+The default output directory is `output/merfish_first_pair/`. It contains
+`midpoint.h5ad` (expected shape: 5,522 cells by 155 genes), `run.json` with
+parameters and completion status, and `environment.json` with installed package
+versions. The run report also counts cells with all-zero generated expression
+for inspection before evaluation. Use `--output` with a new directory to rerun;
+existing run directories are not overwritten.
+
+The generation functions accept `mender_n_jobs`, defaulting to 2 CPU processes.
+This replaces the original fixed count of 200 without changing the
+microenvironment scales or radius. In server environments where existing
+package versions must be preserved, do not install `requirements.txt` directly;
+add missing dependencies and verify the relevant computations first.
+
 **Reference:** Lin, S., Wang, Z., Cui, Y., Zou, Q., Han, C., Yan, R., … & Yuan, Z. (2024). *Bridging the Dimensional Gap from Planar Spatial Transcriptomics to 3D Cell Atlases*. *bioRxiv*, 2024-12.
 
  
