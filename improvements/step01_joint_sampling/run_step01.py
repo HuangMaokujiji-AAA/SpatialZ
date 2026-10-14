@@ -5,6 +5,7 @@ from importlib.metadata import distributions
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import time
 
@@ -19,6 +20,8 @@ def main():
     parser.add_argument("--output", type=Path, help="New directory; existing directories are never overwritten")
     parser.add_argument("--seed", type=int, default=42, help="Expression sampling seed; geometry stays frozen")
     parser.add_argument("--mender-jobs", type=positive_int, default=2)
+    parser.add_argument("--candidate-cache-dir", type=Path,
+                        help="Completed step01 run whose donor pools/probabilities are reused without MENDER")
     args = parser.parse_args()
     if not 0 <= args.seed < 2 ** 32:
         parser.error("--seed must be in [0, 2**32)")
@@ -29,7 +32,6 @@ def main():
     import pandas as pd
     import scanpy as sc
     from scipy import sparse
-    from SpatialZ import perform_microenv_measure
     from sampling import build_candidates, expression_metrics, sample_expression
 
     geometry_dir = args.geometry_dir.resolve()
@@ -68,25 +70,61 @@ def main():
             raise ValueError("All gene identifiers and their order must match")
         # Old expression is not used. Geometry and all cell annotations remain fixed.
         geometry.X = np.zeros(geometry.shape, dtype=adatas[0].X.dtype)
-        report["stage"] = "mender"
-        write_json(output / "run.json", report)
-        print("Computing shared MENDER features using only 0.04, 0.14 and frozen synthetic geometry...", flush=True)
-        adatas[0], adatas[1], geometry = perform_microenv_measure(
-            adatas[0], adatas[1], geometry, "cell_class", scale=6, radius=15,
-            micro_env_key="mender", n_jobs=args.mender_jobs)
-        pd.testing.assert_frame_equal(geometry.obs, frozen_obs)
-        np.testing.assert_array_equal(geometry.obsm["spatial"], frozen["xy"])
         combined_x = np.concatenate([a.X.toarray() if sparse.issparse(a.X) else np.asarray(a.X)
                                      for a in adatas])
-        pools, probabilities = build_candidates(
-            np.concatenate([a.obsm["spatial"] for a in adatas]),
-            np.concatenate([s["cell_class"] for s in sources]),
-            np.concatenate([a.obsm["mender"] for a in adatas]),
-            geometry.obsm["spatial"], frozen["cell_class"], geometry.obsm["mender"],
-            k_sam=50, beta=1)
+        if args.candidate_cache_dir:
+            cache_dir = args.candidate_cache_dir.resolve()
+            cached_run = json.loads((cache_dir / "run.json").read_text(encoding="utf-8"))
+            if cached_run.get("status") != "complete" or any(
+                    cached_run.get(k) != report[k] for k in ("geometry_sha256", "input_sha256", "parameters")):
+                raise ValueError("Candidate cache must use identical inputs, frozen geometry and sampling parameters")
+            print(f"Reusing frozen candidate probabilities: {cache_dir}", flush=True)
+            with np.load(cache_dir / "candidate_cache.npz", allow_pickle=False) as cache:
+                offsets, indices, weights = (cache[k].copy() for k in ("offsets", "indices", "probabilities"))
+            if (offsets.shape != (geometry.n_obs + 1,) or offsets[0] != 0
+                    or not np.issubdtype(offsets.dtype, np.integer) or (np.diff(offsets) < 0).any()
+                    or indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer)
+                    or offsets[-1] != len(indices) or weights.shape != indices.shape
+                    or (indices < 0).any() or (indices >= len(combined_x)).any()
+                    or not np.isfinite(weights).all() or (weights < 0).any()):
+                raise ValueError("Invalid candidate cache arrays")
+            pools = [indices[offsets[i]:offsets[i + 1]] for i in range(geometry.n_obs)]
+            probabilities = [weights[offsets[i]:offsets[i + 1]] for i in range(geometry.n_obs)]
+            reference_types = np.concatenate([s["cell_class"] for s in sources])
+            for i, (pool, probability) in enumerate(zip(pools, probabilities)):
+                if len(pool) and (not np.isclose(probability.sum(), 1)
+                                  or not np.all(reference_types[pool] == frozen["cell_class"][i])):
+                    raise ValueError(f"Invalid candidate types or probability sum at row {i}")
+            cached_geometry = sc.read_h5ad(cache_dir / "gene/generated_009.h5ad")
+            cached = snapshot(cached_geometry, "0.09")
+            for key in ("xy", "genes", "cell_class", "Region"):
+                np.testing.assert_array_equal(cached[key], frozen[key])
+            np.testing.assert_array_equal(cached_geometry.obs_names, geometry.obs_names)
+            geometry.obsm["mender"] = cached_geometry.obsm["mender"].copy()
+            report.update(candidate_cache_source=str(cache_dir),
+                          mender={**cached_run["mender"], "recomputed": False})
+            shutil.copyfile(cache_dir / "candidate_cache.npz", output / "candidate_cache.npz")
+        else:
+            from SpatialZ import perform_microenv_measure
+            report["stage"] = "mender"
+            write_json(output / "run.json", report)
+            print("Computing shared MENDER features using only 0.04, 0.14 and frozen synthetic geometry...", flush=True)
+            adatas[0], adatas[1], geometry = perform_microenv_measure(
+                adatas[0], adatas[1], geometry, "cell_class", scale=6, radius=15,
+                micro_env_key="mender", n_jobs=args.mender_jobs)
+            pd.testing.assert_frame_equal(geometry.obs, frozen_obs)
+            np.testing.assert_array_equal(geometry.obsm["spatial"], frozen["xy"])
+            pools, probabilities = build_candidates(
+                np.concatenate([a.obsm["spatial"] for a in adatas]),
+                np.concatenate([s["cell_class"] for s in sources]),
+                np.concatenate([a.obsm["mender"] for a in adatas]),
+                geometry.obsm["spatial"], frozen["cell_class"], geometry.obsm["mender"],
+                k_sam=50, beta=1)
+            lengths = np.array([len(p) for p in pools])
+            np.savez_compressed(output / "candidate_cache.npz", offsets=np.r_[0, np.cumsum(lengths)],
+                                indices=np.concatenate(pools), probabilities=np.concatenate(probabilities))
         lengths = np.array([len(p) for p in pools])
-        np.savez_compressed(output / "candidate_cache.npz", offsets=np.r_[0, np.cumsum(lengths)],
-                            indices=np.concatenate(pools), probabilities=np.concatenate(probabilities))
+        report["candidate_cache_sha256"] = sha256(output / "candidate_cache.npz")
         pd.DataFrame(dict(cell_id=geometry.obs_names.astype(str),
                           cell_class=frozen["cell_class"], candidate_count=lengths)).to_csv(
                               output / "candidate_counts.csv", index=False)

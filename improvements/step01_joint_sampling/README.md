@@ -110,3 +110,43 @@ python -m unittest discover -s improvements/step01_joint_sampling -p "test_*.py"
 测试验证原函数采样规则一致性、整细胞供体一致性、空候选行为、协方差指标和两组保存后才读取真实切片的顺序。端到端检查使用模拟 AnnData 和 MENDER；它不是服务器上的真实 MERFISH 实验。
 
 运行成功后，将整个 `output/step01_joint_sampling_seed42/` 下载到本地即可比较两组结果。
+
+## 在同一冻结切片上重复表达种子
+
+新增 `run_step01_seeds.py`，默认汇总 42、43、44、45 四个种子。42 直接复制已完成结果；43、44、45 均复用 42 保存的候选索引、概率和生成切片 MENDER 特征，不再重算 MENDER，不修改采样算法。脚本核对输入、冻结切片、候选缓存与评估参数一致。
+
+更新代码后，在服务器仓库根目录执行：
+
+```bash
+git pull --ff-only origin master
+python -u improvements/step01_joint_sampling/run_step01_seeds.py
+```
+
+需要服务器上保留 `output/step01_joint_sampling_seed42/` 和 `output/merfish_holdout_009/`。默认输出为 `output/step01_joint_sampling_multiseed/`，其中有 `seed42/` 至 `seed45/` 的完整结果以及以下汇总：
+
+| 文件 | 含义 |
+| --- | --- |
+| `all_seed_comparison.csv` | 每个种子、每组的整体指标 |
+| `all_seed_by_cell_class.csv` | 每个种子、每组的分类型指标 |
+| `stability_overall.csv` | 整体指标跨种子均值、标准差和配对改善次数 |
+| `stability_by_cell_class.csv` | 分类型指标的相同汇总 |
+
+`paired_error_reduction = gene 与理想值的距离 - cell 与理想值的距离`，正值为改善。均值偏差以 0 为理想值，方差比以 1 为理想值，误差指标以 0 为理想值。`improved_seeds` 表示改善的种子数，`paired_error_reduction_min/max` 表示最小/最大改善幅度。跨种子标准差使用 `ddof=1`，不是置信区间。
+
+对相关矩阵，优先查看新增 `shared_gene_correlation_mae`：每个类型在真值以及所有种子、两组中共同非恒定的基因上计算，确保比较同一组基因对。`shared_gene_pairs` 记录覆盖数量；某些恒定基因仍可能被排除，需要结合原指标中的 `collapsed_real_variable_genes` 判断。`offdiag_correlation_mae` 保留原口径，不作为覆盖完全一致的比较。
+
+如需改为其他种子或新输出目录：
+
+```bash
+python -u improvements/step01_joint_sampling/run_step01_seeds.py --seeds 42 43 44 45 46 --output output/step01_joint_sampling_multiseed_5
+```
+
+现有输出不会被覆盖；批次失败也保留已完成结果，通过 `run.json` 查看进度。再次运行需指定新输出目录。这些重复仅衡量固定切片与供体分布下的表达抽样波动，不能替代多张独立留出切片的验证。
+
+单独运行一个新种子并固定原候选缓存也可以：
+
+```bash
+python -u improvements/step01_joint_sampling/run_step01.py --seed 43 --candidate-cache-dir output/step01_joint_sampling_seed42 --output output/step01_joint_sampling_seed43
+```
+
+完成后下载整个 `output/step01_joint_sampling_multiseed/`，即可分析改善是否跨种子一致。

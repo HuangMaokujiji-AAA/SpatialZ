@@ -17,6 +17,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_step01
+import run_step01_seeds
 from sampling import build_candidates, expression_metrics, sample_expression
 
 
@@ -128,6 +129,34 @@ class Step01Tests(unittest.TestCase):
         self.assertFalse(expression_metrics(real[:3], real)["covariance_eligible"])
         self.assertIsNone(expression_metrics(real[:0], real)["total_expression_mean"])
 
+    def test_seed_summary_compares_distance_to_one_for_variance_ratio(self):
+        table = pd.DataFrame(dict(seed=[42, 42, 43, 43], arm=["gene", "cell"] * 2,
+                                  total_variance_ratio=[.5, 1.5, 1.25, 1.75],
+                                  offdiag_covariance_relative_error=[.2, .1, .3, .2]))
+        summary = run_step01_seeds.summarize(table, None).set_index("metric")
+        variance = summary.loc["total_variance_ratio"]
+        self.assertEqual(variance["improved_seeds"], 0)
+        self.assertAlmostEqual(variance["paired_error_reduction_mean"], -.25)
+        covariance = summary.loc["offdiag_covariance_relative_error"]
+        self.assertEqual(covariance["improved_seeds"], 2)
+        self.assertAlmostEqual(covariance["gene_std"], np.std([.2, .3], ddof=1))
+
+    def test_correlation_uses_same_genes_across_all_seeds_and_arms(self):
+        reference = FixtureSlice(40, "0.09", [])
+        generated = {(seed, arm): reference.copy() for seed in (42, 43) for arm in ("gene", "cell")}
+        generated[43, "cell"].X[:, 2] = 0  # One seed collapses a gene; all comparisons exclude it.
+        def read(path):
+            if path.name == "truth.h5ad":
+                return reference
+            return generated[int(path.parent.parent.name[4:]), path.parent.name]
+        with patch.dict(sys.modules, {"scanpy": SimpleNamespace(read_h5ad=read)}):
+            table = run_step01_seeds.shared_gene_correlations(
+                {42: Path("seed42"), 43: Path("seed43")}, Path("truth.h5ad"))
+        self.assertEqual(len(table), 8)  # Overall and class A, for two seeds and two arms.
+        self.assertTrue((table.shared_variable_genes == 1).all())
+        self.assertTrue((table.shared_gene_pairs == 0).all())
+        self.assertTrue(table.shared_gene_correlation_mae.isna().all())
+
     def test_run_saves_both_arms_before_reading_target_and_preserves_geometry(self):
         events = []
         fixtures = {"merfish_4_paste.h5ad": FixtureSlice(2, "0.04", events),
@@ -167,6 +196,38 @@ class Step01Tests(unittest.TestCase):
                 # Existing results must be protected from accidental reruns.
                 with self.assertRaises(FileExistsError):
                     run_step01.main()
+                original_events = events.copy()
+                events.clear()
+                repeat = directory / "seed43"
+                repeat_argv = argv[:-1] + [str(repeat), "--seed", "43", "--candidate-cache-dir", str(output)]
+                with patch.object(sys, "argv", repeat_argv):
+                    run_step01.main()
+                repeated_run = json.loads((repeat / "run.json").read_text())
+                self.assertFalse(repeated_run["mender"]["recomputed"])
+                self.assertEqual(repeated_run["expression_seed"], 43)
+                self.assertNotIn("mender", events)
+                self.assertEqual((repeat / "candidate_cache.npz").read_bytes(),
+                                 (output / "candidate_cache.npz").read_bytes())
+                self.assertLess(events.index("save_cell"), events.index("read_merfish_9_paste.h5ad"))
+                batch = directory / "batch"
+                batch_argv = ["run_step01_seeds.py", "--seeds", "42", "44",
+                              "--reference-run", str(output), "--geometry-dir", str(geometry_dir),
+                              "--output", str(batch)]
+                def child(command, **kwargs):
+                    self.assertIn("--candidate-cache-dir", command)
+                    with patch.object(sys, "argv", command[2:]):
+                        run_step01.main()
+                with patch.object(sys, "argv", batch_argv), \
+                        patch.object(run_step01_seeds, "sha256", return_value="fixture"), \
+                        patch.object(run_step01_seeds.subprocess, "run", side_effect=child) as launch:
+                    run_step01_seeds.main()
+                self.assertEqual(launch.call_count, 1)  # Seed 42 is copied, not regenerated.
+                batch_report = json.loads((batch / "run.json").read_text())
+                self.assertEqual(batch_report["completed_seeds"], [42, 44])
+                self.assertEqual(batch_report["status"], "complete")
+                self.assertEqual(pd.read_csv(batch / "all_seed_comparison.csv").seed.tolist(),
+                                 [42, 42, 44, 44])
+                self.assertTrue((batch / "stability_by_cell_class.csv").is_file())
             report = json.loads((output / "run.json").read_text())
             self.assertEqual(report["status"], "complete")
             self.assertEqual(report["frozen_shape"], [3, 3])
@@ -177,7 +238,7 @@ class Step01Tests(unittest.TestCase):
                          "step01_by_cell_class.csv", "gene/generated_009.h5ad", "cell/donors.csv",
                          "gene/metrics.json", "cell/expression_comparison.png"):
                 self.assertTrue((output / name).is_file(), name)
-        self.assertEqual(events, ["read_merfish_4_paste.h5ad", "read_merfish_14_paste.h5ad",
+        self.assertEqual(original_events, ["read_merfish_4_paste.h5ad", "read_merfish_14_paste.h5ad",
             "read_generated_009.h5ad", "mender", "save_gene", "save_cell", "read_merfish_9_paste.h5ad"])
 
 
