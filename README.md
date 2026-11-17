@@ -187,6 +187,11 @@ SpatialZ 是逐对切片求 Wasserstein 重心的基线，仓库没有流匹配�
 **不声称执行了流匹配训练或 RARS 训练**。
 
 按真实 Z 距离计算 SpatialZ 的左端点权重 `alpha`：#6 为 1/2，#34 为 2/3。
+默认 `--spatial-mode whole` 与 `run_merfish_holdout.py` 一样，对每张目标片只调用
+一次 `Generate_spatialz`，输入为两张完整端点，细胞数取端点整片计数的加权平均，
+不构建 Tile、不裁剪、不读取其他训练片的 XY 来拟合网格。
+
+可选的 `--spatial-mode tiled` 保留最初指定的分块协议：
 XY 使用 1500 × 1500 μm 核心窗口、150 μm Halo；网格原点和范围仅由 13 片
 训练观测确定。每个窗口共用相同 XY 范围贯穿各片，生成时使用扩展窗口，拼接时
 按左闭右开的核心边界裁剪。目标细胞数取端点窗口的加权计数，不读取真实目标片
@@ -244,16 +249,31 @@ Scanpy 1.10.3 / Numba 0.59 服务器环境补包，先保存全部已安装版�
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
-  --device cuda:0 --mender-jobs 2 \
-  --output output/openst_direct
+  --spatial-mode whole --device cuda:0 --mender-jobs 2 \
+  --output output/openst_whole
 ```
 
 `--stage test` 是默认阶段，不要求也不读取 `selection.json`。
 日志中的坐标迭代是每次重建内部的 Wasserstein 重心求解，不是模型训练；
 MENDER 也是对本次输入/生成片计算微环境表征，没有跨样本学习的权重。
-Core/Halo 分块、坐标优化和逐基因表达合成仍需计算时间。
-若旧命令正在重建 #6，可以用 Ctrl+C 停止后运行上述直接测试命令。
-旧选参目录的结果可保留，使用新的 `output/openst_direct` 避免混淆。
+坐标优化和逐基因表达合成仍需计算时间。整片模式的中间表达矩阵为稠密存储，
+本数据单次输出矩阵约 5.5–6.4 GB，实际峰值还包含端点、采样和 MENDER 中间量；
+读入与最终保存使用 CSR。内存受限时可显式使用 `--spatial-mode tiled`。
+整片重心求解与局部窗口求解的结果不同；两种模式不能混用同一结果目录。
+
+建议先仅运行一张目标片、一个轨道实测时间与内存：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
+  --spatial-mode whole --device cuda:0 --targets 4 --tracks 1 \
+  --output output/openst_whole
+```
+
+随后运行前面的完整命令，已完成的 #4/Track 1 会复用；还可使用 `--targets`
+指定其他测试片组合。每次的 `test_summary.csv`、`test_macro.csv` 只汇总当次请求
+的目标与轨道，并用 `test_scope.json` 记录范围；各切片结果文件持续保留。
+旧进程可用 Ctrl+C 停止后切换到整片模式。之前分块结果保留，继续分块时使用
+`--spatial-mode tiled --output output/openst_direct`；整片使用新的 `output/openst_whole`。
 
 只有需要额外比较超参数时，才显式运行以下可选流程：
 
@@ -277,9 +297,9 @@ SpatialZ 没有跨数据集训练的 epoch，不能实现神经网络式早停�
 ```
 
 默认输出包括 `protocol.json`、四份划分 CSV、记录参数来源的
-`test_parameters.json`、`test_summary.csv` 和四个测试片等权的 `test_macro.csv`。
+`test_parameters.json`、`test_scope.json`、`test_summary.csv` 和各测试片等权的 `test_macro.csv`。
 可选选参流程还会生成 `validation_scores.csv` 和冻结的 `selection.json`。
-各轨道各切片目录保存 `generated.h5ad`、逐 Tile 检查点、`tiles.csv`、
+各轨道各切片目录保存 `generated.h5ad`（分块模式另有逐 Tile 检查点和 `tiles.csv`）、
 `metrics.json`、逐基因与逐细胞类型 CSV、任务配置和运行状态。
 指标覆盖空间 SW1/双向最近邻距离、类型比例总变差、细胞数误差、表达均值相关性
 和误差、方差相关性、检测率误差及全零表达细胞数，并同时报告两端点与表达加权
@@ -288,8 +308,9 @@ SpatialZ 没有跨数据集训练的 epoch，不能实现神经网络式早停�
 同一命令可恢复已完成的任务和 Tile。输入文件大小/修改时间、坐标字段、缩放和
 网格配置必须与 `protocol.json` 相同；每个已运行任务的参数、种子和设备也必须
 匹配，否则使用新的 `--output`。正式测试后不要在同一结果目录更换候选参数。
-完整数据保持 CSR 存储；表达合成按块计算余弦相似度、向量化独立逐基因采样，
-保留原有候选邻域规则。稀疏/稠密输入的采样回归检查与完整命令的模拟生成检查：
+表达合成仅计算有效近邻候选的余弦相似度、向量化独立逐基因采样，保留原有
+候选邻域和采样规则，避免整片所有参考细胞与生成细胞之间的相似度计算。
+稀疏/稠密输入的采样回归检查与完整命令的模拟生成检查：
 
 ```bash
 python -m unittest discover -s tests -v

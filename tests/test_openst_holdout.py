@@ -25,6 +25,17 @@ except ImportError:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_whole_mode_does_not_read_training_xy_to_make_a_grid(self):
+        data = SimpleNamespace(path=Path(runner.__file__), section_key='n_section',
+                               annotation_key='annotation', spatial_key='spatial_3d_aligned',
+                               rows={s: [s] for s in runner.SECTIONS}, z={s: s * 30. for s in runner.SECTIONS})
+        data.xy = lambda s: self.fail('Whole mode must not build a training grid')
+        p = runner.make_protocol(data, SimpleNamespace(spatial_mode='whole', core_um=1500.,
+                                 halo_um=150., xy_scale=1., z_scale=1.))
+        self.assertEqual(p['spatial_mode'], 'whole')
+        self.assertEqual(p['tiles'], [])
+        self.assertIsNone(p['grid_origin_um'])
+
     def test_physical_splits_weights_and_training_only_grid(self):
         reads = []
         data = SimpleNamespace(path=Path(runner.__file__), section_key='n_section',
@@ -142,7 +153,7 @@ class IntegrationTests(unittest.TestCase):
                 yield generate, SimpleNamespace(manual_seed=lambda s: None), 'cpu'
 
             argv = ['--stage', 'all', '--input', str(source), '--output', str(output), '--core-um', '10',
-                    '--halo-um', '2', '--candidates', str(candidates), '--eval-projections', '4']
+                    '--spatial-mode', 'tiled', '--halo-um', '2', '--candidates', str(candidates), '--eval-projections', '4']
             with patch.object(runner, 'generation_backend', backend), patch.object(runner.OpenST, 'section', read):
                 runner.main(argv)
                 selection = json.loads((output / 'selection.json').read_text())
@@ -175,7 +186,7 @@ class IntegrationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'frozen validation'):
                     runner.main(['--stage', 'selected-test', '--input', str(source),
                                  '--output', str(output), '--core-um', '10', '--halo-um', '2',
-                                 '--eval-projections', '4', '--seed', '43'])
+                                 '--spatial-mode', 'tiled', '--eval-projections', '4', '--seed', '43'])
                 with self.assertRaisesRegex(ValueError, 'protocol changed'):
                     runner.main(argv + ['--halo-um', '3'])
 
@@ -183,8 +194,15 @@ class IntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             source, output = Path(temp) / 'input.h5ad', Path(temp) / 'direct'
             self.fixture(source)
+            # Target #4 has seven cells; its endpoints each have eight. Prediction
+            # must request eight from endpoints, without consulting the target.
+            fixture = ad.read_h5ad(source)
+            keep = np.ones(fixture.n_obs, dtype=bool)
+            keep[np.flatnonzero(fixture.obs['n_section'].to_numpy() == 4)[-1]] = False
+            fixture[keep].copy().write_h5ad(source)
             original = runner.OpenST.section
             reads = []
+            generations = []
 
             def read(data, section, track):
                 self.assertNotIn(section, runner.VALIDATION)
@@ -194,8 +212,12 @@ class IntegrationTests(unittest.TestCase):
                 return original(data, section, track)
 
             def generate(a, b, **p):
+                generations.append(p)
                 self.assertEqual(p['nb_iter_max'], runner.DEFAULT_PARAMETERS['iterations'])
                 self.assertEqual(p['Beta'], runner.DEFAULT_PARAMETERS['beta'])
+                self.assertEqual(a.n_obs, 8)
+                self.assertEqual(b.n_obs, 8)
+                self.assertEqual(p['n_cell'], 8)
                 combined = ad.concat([a, b])
                 return combined[np.linspace(0, combined.n_obs - 1, p['n_cell'], dtype=int)].copy()
 
@@ -214,14 +236,22 @@ class IntegrationTests(unittest.TestCase):
                 runner.main(argv)
                 self.assertEqual({s for s, _ in reads if s in runner.TEST}, set(runner.TEST))
                 self.assertEqual(sum(s in runner.TEST for s, _ in reads), 8)
+                self.assertEqual(len(generations), 8)  # Exactly one call per target and track.
+                self.assertEqual(json.loads((output / 'protocol.json').read_text())['spatial_mode'], 'whole')
                 settings = json.loads((output / 'test_parameters.json').read_text())
                 self.assertEqual(settings['parameter_source'], 'fixed_defaults')
                 self.assertFalse((output / 'track1/validation').exists())
                 self.assertFalse((output / 'validation_scores.csv').exists())
                 self.assertEqual(len(pd.read_csv(output / 'test_summary.csv')), 24)
+                metric = json.loads((output / 'track1/test/section_4/metrics.json').read_text())
+                self.assertEqual(metric['comparisons']['generated']['n_cells'], 8)
+                self.assertEqual(metric['comparisons']['generated']['real_n_cells'], 7)
                 reads.clear()
                 runner.main(argv)
                 self.assertEqual(reads, [])
+                self.assertEqual(len(generations), 8)
+                runner.main(argv + ['--targets', '4', '--tracks', '1'])
+                self.assertEqual(len(pd.read_csv(output / 'test_summary.csv')), 3)
 
     def test_empty_tiles_and_single_endpoint_fallback_resume(self):
         def endpoint(x):
@@ -265,7 +295,7 @@ class IntegrationTests(unittest.TestCase):
         calls = []
 
         def cosine(a, b):
-            calls.append(b.shape[0])
+            calls.append((a.shape[0], b.shape[0]))
             return cosine_similarity(a, b)
 
         namespace = dict(np=np, pd=pd, cKDTree=cKDTree, cosine_similarity=cosine,
@@ -296,7 +326,8 @@ class IntegrationTests(unittest.TestCase):
             result = namespace['synthesize_gene_expression']([ref[:3].copy(), ref[3:].copy()],
                           query, 'ct', 4, 'env', 1., chunk_size=2)
             np.testing.assert_array_equal(result.X, expected)
-            self.assertEqual(calls[-2:], [2, 1])
+            self.assertEqual(len(calls), 3 * (1 + int(use_sparse)))
+            self.assertTrue(all(n_ref <= 4 and n_query == 1 for n_ref, n_query in calls))
 
 
 if __name__ == '__main__':

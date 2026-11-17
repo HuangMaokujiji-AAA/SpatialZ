@@ -275,7 +275,7 @@ def perform_microenv_measure(adata1, adata2, adata3, cell_type_key,
 
 def synthesize_gene_expression(reference_adatas, query_adata, cell_type_key, k_sam, micro_env_key, Beta,
                                chunk_size=256):
-    """Same independent per-gene donor sampling, with bounded similarity memory."""
+    """Same per-gene donor sampling; cosine scores only for eligible neighbors."""
     if micro_env_key not in query_adata.obsm:
         raise ValueError(f"Microenvironment key '{micro_env_key}' is not present in query dataset. Please perform microenvironment measurement calculations first.")
     if not isinstance(chunk_size, int) or chunk_size < 1:
@@ -291,8 +291,6 @@ def synthesize_gene_expression(reference_adatas, query_adata, cell_type_key, k_s
     gene_indices = np.arange(query_adata.n_vars)
     for start in range(0, query_adata.n_obs, chunk_size):
         stop = min(start + chunk_size, query_adata.n_obs)
-        similarities = cosine_similarity(combined_adata.obsm[micro_env_key],
-                                         query_adata.obsm[micro_env_key][start:stop])
         # Keep the original rule: query globally, then filter for the same type.
         _, neighbors = kdtree.query(query_adata.obsm['spatial'][start:stop],
                                     k=min(k_sam, combined_adata.n_obs))
@@ -304,7 +302,11 @@ def synthesize_gene_expression(reference_adatas, query_adata, cell_type_key, k_s
             indices = neighbors[offset, :min(k_sam, same_count)]
             valid_indices = indices[labels[indices] == cell_type]
             if len(valid_indices):
-                logits = Beta * similarities[valid_indices, offset]
+                # Scores outside this neighborhood never enter donor sampling.
+                similarities = cosine_similarity(
+                    combined_adata.obsm[micro_env_key][valid_indices],
+                    query_adata.obsm[micro_env_key][i:i + 1]).ravel()
+                logits = Beta * similarities
                 weights = np.exp(logits - logits.max())
                 weights /= weights.sum()
                 chosen = np.random.choice(len(valid_indices), size=query_adata.n_vars, p=weights)

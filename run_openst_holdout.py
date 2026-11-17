@@ -161,19 +161,22 @@ def in_box(xy, bounds, halo=0.):
 
 
 def make_protocol(data, args):
-    # The global column grid is fitted to visible training observations only.
-    low, high = np.full(2, np.inf), np.full(2, -np.inf)
-    for s in TRAIN:
-        xy = data.xy(s)
-        low, high = np.minimum(low, xy.min(0)), np.maximum(high, xy.max(0))
-    origin = np.floor(low / args.core_um) * args.core_um
-    shape = (np.floor((high - origin) / args.core_um).astype(int) + 1).tolist()
+    mode = getattr(args, 'spatial_mode', 'tiled')
+    origin, shape = None, None
     tiles = []
-    for ix in range(shape[0]):
-        for iy in range(shape[1]):
-            x0, y0 = origin + args.core_um * np.array([ix, iy])
-            tiles.append(dict(id=len(tiles), bounds=[float(x0), float(y0),
-                                                    float(x0 + args.core_um), float(y0 + args.core_um)]))
+    if mode == 'tiled':
+        # The optional global column grid uses visible training observations only.
+        low, high = np.full(2, np.inf), np.full(2, -np.inf)
+        for s in TRAIN:
+            xy = data.xy(s)
+            low, high = np.minimum(low, xy.min(0)), np.maximum(high, xy.max(0))
+        origin = np.floor(low / args.core_um) * args.core_um
+        shape = (np.floor((high - origin) / args.core_um).astype(int) + 1).tolist()
+        for ix in range(shape[0]):
+            for iy in range(shape[1]):
+                x0, y0 = origin + args.core_um * np.array([ix, iy])
+                tiles.append(dict(id=len(tiles), bounds=[float(x0), float(y0),
+                                                        float(x0 + args.core_um), float(y0 + args.core_um)]))
     stat = data.path.stat()
     return dict(schema=1, method='SpatialZ baseline (no flow matching or RARS)',
                 input=dict(path=str(data.path), bytes=stat.st_size, mtime_ns=stat.st_mtime_ns),
@@ -188,7 +191,8 @@ def make_protocol(data, args):
                                 for a, b in zip(TRAIN, TRAIN[1:])],
                 pseudo_holdouts=[triplet(a, t, b, data.z)
                                  for a, t, b in zip(TRAIN, TRAIN[1:], TRAIN[2:])],
-                core_um=args.core_um, halo_um=args.halo_um, grid_origin_um=origin.tolist(),
+                spatial_mode=mode, core_um=args.core_um, halo_um=args.halo_um,
+                grid_origin_um=None if origin is None else origin.tolist(),
                 grid_shape=shape, tiles=tiles, track2_mapping=COARSE,
                 upstream_note='The supplied globally aligned/processed file is used as-is; '
                               'upstream registration/normalization leakage is not re-estimated.')
@@ -309,6 +313,57 @@ def generate_tiles(data, task, track, protocol, parameters, args, directory, bac
     return (a, b), generated, records
 
 
+def generate_whole(data, task, track, protocol, parameters, args, directory, backend):
+    """One call on the two full endpoints, matching the MERFISH runner's workflow."""
+    import anndata as ad
+
+    generate, torch, device = backend
+    a, b = data.section(task['left'], track), data.section(task['right'], track)
+    path = directory / 'generated.h5ad'
+    if path.exists():
+        return (a, b), ad.read_h5ad(path), []
+    alpha = task['alpha_left']
+    n_cell = int(alpha * a.n_obs + (1 - alpha) * b.n_obs)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    print(f"Track {track} #{task['target']} whole slice: "
+          f"{a.n_obs}/{b.n_obs} -> {n_cell} cells, {a.n_vars} genes", flush=True)
+    start = time.perf_counter()
+    g = generate(a.copy(), b.copy(), adata1_id=f"left_s{task['left']}",
+                 adata2_id=f"right_s{task['right']}", alpha=alpha, n_cell=n_cell,
+                 device=device, seed=args.seed, nb_iter_max=parameters['iterations'],
+                 lr=parameters['lr'], num_projections=parameters['projections'],
+                 cell_type_key='cell_type', syn_mode=parameters['syn_mode'],
+                 k_sam=parameters['k_sam'], Beta=parameters['beta'],
+                 add_obs_list=None, mender_n_jobs=args.mender_jobs, verbose=True)
+    if g.n_obs != n_cell or not np.array_equal(g.var_names, data.genes):
+        raise ValueError('Generator changed requested count or gene order')
+    xy = np.asarray(g.obsm['spatial'])
+    if xy.shape != (n_cell, 2) or not np.isfinite(xy).all():
+        raise ValueError('Generator returned invalid coordinates')
+    # Convert before constructing the saved object; avoid a second dense slice copy.
+    g.X = sparse.csr_matrix(g.X)
+    g.X.eliminate_zeros()
+    if not np.isfinite(g.X.data).all() or (g.X.data < 0).any():
+        raise ValueError('Generator returned invalid expression')
+    generated = ad.AnnData(X=g.X, var=pd.DataFrame(index=data.genes),
+        obs=pd.DataFrame({'cell_type': pd.Categorical(g.obs['cell_type'].astype(str).to_numpy()),
+                          'section': task['target'], 'track': track, 'data_type': 'synthetic',
+                          'generation_method': 'SpatialZ_whole'},
+                         index=[f"t{track}_s{task['target']}_c{i}" for i in range(n_cell)]),
+        obsm={'spatial': xy.copy(), 'spatial_3d_aligned':
+              np.column_stack((xy, np.full(n_cell, data.z[task['target']])))})
+    del g
+    generated.uns['openst_task'] = {**task, 'track': track, 'parameters': parameters,
+                                   'spatial_mode': 'whole'}
+    temporary = directory / 'generated.tmp.h5ad'
+    generated.write_h5ad(temporary)
+    temporary.replace(path)
+    print(f"Whole-slice prediction saved in {time.perf_counter() - start:.1f}s; "
+          'reading target for evaluation next.', flush=True)
+    return (a, b), generated, []
+
+
 def expression_stats(adata):
     x = sparse.csr_matrix(adata.X, dtype=np.float64)
     x.sum_duplicates()
@@ -389,10 +444,13 @@ def run_task(data, task, track, protocol, parameters, args, directory, backend):
     directory.mkdir(parents=True, exist_ok=True)
     identity = dict(task=task, track=track, parameters=parameters, seed=args.seed,
                     device=backend[2], mender_jobs=args.mender_jobs,
-                    eval_projections=args.eval_projections)
+                    eval_projections=args.eval_projections, spatial_mode=args.spatial_mode)
     identity_path = directory / 'task.json'
-    if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
-        raise ValueError(f'Task settings changed: use a new output directory ({directory})')
+    if identity_path.exists():
+        saved = json.loads(identity_path.read_text())
+        saved.setdefault('spatial_mode', 'tiled')  # Earlier runner versions only tiled.
+        if saved != identity:
+            raise ValueError(f'Task settings changed: use a new output directory ({directory})')
     write_json(identity_path, identity)
     metrics_path = directory / 'metrics.json'
     if metrics_path.exists():
@@ -400,8 +458,9 @@ def run_task(data, task, track, protocol, parameters, args, directory, backend):
     start = time.perf_counter()
     report = dict(status='running', **identity)
     try:
-        sources, generated, records = generate_tiles(data, task, track, protocol, parameters,
-                                                    args, directory, backend)
+        generator = generate_whole if args.spatial_mode == 'whole' else generate_tiles
+        sources, generated, records = generator(data, task, track, protocol, parameters,
+                                                args, directory, backend)
         # Prediction has been persisted before the held-out expression/XY/labels are read.
         report.update(stage='evaluating')
         write_json(directory / 'run.json', report)
@@ -465,13 +524,21 @@ def run_test(data, protocol, selection, args, backend):
                         else selection['tracks'][str(t)]['parameters']) for t in args.tracks},
                     seed=args.seed, eval_projections=args.eval_projections, mender_jobs=args.mender_jobs)
     path = args.output / 'test_parameters.json'
-    if path.exists() and json.loads(path.read_text()) != settings:
-        raise ValueError('Test parameters or their source changed; use a new output directory')
+    if path.exists():
+        saved = json.loads(path.read_text())
+        previous = saved.pop('parameters_by_track')
+        current = {k: v for k, v in settings.items() if k != 'parameters_by_track'}
+        if saved != current or any(t in previous and previous[t] != p
+                                   for t, p in settings['parameters_by_track'].items()):
+            raise ValueError('Test parameters or their source changed; use a new output directory')
+        settings['parameters_by_track'] = {**previous, **settings['parameters_by_track']}
     write_json(path, settings)
     rows = []
     for track in args.tracks:
         parameters = settings['parameters_by_track'][str(track)]
         for task in protocol['test']:
+            if task['target'] not in args.targets:
+                continue
             directory = args.output / f'track{track}' / 'test' / f"section_{task['target']}"
             metrics = run_task(data, task, track, protocol, parameters, args, directory, backend)
             for name, values in metrics['comparisons'].items():
@@ -479,6 +546,7 @@ def run_test(data, protocol, selection, args, backend):
                                  fallback_cells=metrics['fallback_cells'], **values))
     table = pd.json_normalize(rows)
     table.to_csv(args.output / 'test_summary.csv', index=False)
+    write_json(args.output / 'test_scope.json', dict(tracks=args.tracks, targets=args.targets))
     # Macro-average sections, not cells: each topology milestone has equal weight.
     numeric = [c for c in table.select_dtypes(include='number') if c not in ('track', 'target')]
     table.groupby(['track', 'comparison'])[numeric].mean().to_csv(args.output / 'test_macro.csv')
@@ -494,6 +562,11 @@ def main(argv=None):
                         'all: validate then test; selected-test: reuse frozen validation selection')
     parser.add_argument('--candidates', type=Path, help='JSON list of validation-only hyperparameter candidates')
     parser.add_argument('--tracks', type=int, nargs='+', choices=[1, 2], default=[1, 2])
+    parser.add_argument('--targets', type=int, nargs='+', choices=list(TEST), default=list(TEST),
+                        help='Test sections to reconstruct (default: all four); e.g. --targets 4')
+    parser.add_argument('--spatial-mode', choices=['whole', 'tiled'], default='whole',
+                        help='whole: one Generate_spatialz call per target, like MERFISH; '
+                        'tiled: original Core/Halo protocol')
     parser.add_argument('--device', default='auto')
     parser.add_argument('--mender-jobs', type=int, default=2)
     parser.add_argument('--seed', type=int, default=42)
@@ -513,6 +586,8 @@ def main(argv=None):
         parser.error('Invalid seed, worker count, projection count, coordinate scale or tile dimensions')
     if len(set(args.tracks)) != len(args.tracks):
         parser.error('Do not repeat tracks')
+    if len(set(args.targets)) != len(args.targets):
+        parser.error('Do not repeat targets')
     if args.candidates is not None and args.stage in ('test', 'selected-test'):
         parser.error('--candidates is for --stage validate or --stage all; '
                      'omit it for direct fixed-parameter testing')
@@ -526,13 +601,16 @@ def main(argv=None):
         protocol = make_protocol(data, args)
         args.output.mkdir(parents=True, exist_ok=True)
         path = args.output / 'protocol.json'
-        if path.exists() and json.loads(path.read_text()) != protocol:
-            raise ValueError('Input or protocol changed: use a new output directory')
+        if path.exists():
+            saved = json.loads(path.read_text())
+            saved.setdefault('spatial_mode', 'tiled')
+            if saved != protocol:
+                raise ValueError('Input or protocol changed: use a new output directory')
         write_json(path, protocol)
         for key in ('training_pairs', 'pseudo_holdouts', 'validation', 'test'):
             pd.DataFrame(protocol[key]).to_csv(args.output / f'{key}.csv', index=False)
         print(f"Prepared {len(SECTIONS)} sections, {len(data.sections):,} cells, "
-              f"{len(protocol['tiles'])} columns. Output: {args.output}", flush=True)
+              f"mode={args.spatial_mode}, {len(protocol['tiles'])} columns. Output: {args.output}", flush=True)
         if args.stage == 'prepare':
             return
         if args.stage == 'selected-test' and not (args.output / 'selection.json').exists():
@@ -542,8 +620,8 @@ def main(argv=None):
             write_json(args.output / 'environment.json', environment)
             if args.stage == 'test':
                 selection = None
-                print('Direct SpatialZ baseline: fixed parameters, four test slices per track; '
-                      'no validation selection or model training.', flush=True)
+                print(f'Direct SpatialZ baseline: fixed parameters, targets={args.targets}, '
+                      f'tracks={args.tracks}; no validation selection or model training.', flush=True)
             elif args.stage in ('validate', 'all'):
                 selection = run_validation(data, protocol, candidates, args, backend)
             else:
