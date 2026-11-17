@@ -217,6 +217,26 @@ python run_openst_holdout.py --stage prepare
 `data/Open-ST/GSE251926_metastatic_lymph_node_3d.h5ad`，与服务器目录结构一致，
 无需传 `--input`，也不受启动命令所在目录影响。其他数据位置仍可用 `--input` 指定。
 正式运行需要项目原有的 PyTorch、POT、AnnData、Scanpy、SOMENDER 等依赖。
+如果服务器已经具备这些基础数值包，但报 `No module named 'MENDER'`，运行：
+
+```bash
+bash scripts/install_openst_deps.sh
+```
+
+该安装脚本针对本次提供的 Python 3.10 / NumPy 1.24.4 / SciPy 1.12.0 /
+Scanpy 1.10.3 / Numba 0.59 服务器环境补包，先保存全部已安装版本作为约束，
+按 `requirements-openst-extra.txt` 安装缺失的运行时依赖，再通过 `--no-deps`
+安装 `SOMENDER==1.1`（导入名 `MENDER`）和 `squidpy==1.2.3`。不直接重装
+仓库原始 `requirements.txt`，避免替换已有的 NVIDIA PyTorch 与数值库。
+安装后会运行真实的 POT 优化、MENDER 计算和 8 个模拟细胞的 SpatialZ 生成检查；
+该检查使用 GPU（可用时）或 CPU，不读取真实 Open-ST 数据。
+安装前后版本记录保存在 `output/openst_dependency_setup/`。
+
+这里刻意沿用服务器的现有数值版本，因此不满足 SOMENDER 的全部历史版本声明；
+`pip check` 仍可能提示其精确版本不符。此兼容组合需要以生成检查和正式运行
+结果验证。若约束冲突，安装器会报错而不会自动降级已有包；独立重跑检查可用
+`python scripts/check_openst_dependencies.py`。
+
 以下命令对两个轨道、两个验证片运行三组候选参数，再锁定每轨道最优配置，
 最后生成和评估四个测试片：
 

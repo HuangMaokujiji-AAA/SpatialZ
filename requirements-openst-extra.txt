@@ -1,0 +1,17 @@
+# Additional runtime imports for SOMENDER 1.1 / Squidpy 1.2.3 on the supplied
+# Python 3.10, NumPy 1.24.4, SciPy 1.12.0, Scanpy 1.10.3 server environment.
+# Install under a snapshot of existing-package constraints; see
+# scripts/install_openst_deps.sh. SOMENDER and Squidpy themselves are installed
+# separately with --no-deps to avoid their incompatible historical version pins.
+dask[array,dataframe]>=2023.2.0,<2024.2
+dask-image==2023.8.1
+docrep==0.3.2
+leidenalg==0.10.2
+matplotlib-scalebar==0.8.1
+omnipath==1.0.8
+scikit-image==0.20.0
+tifffile==2023.7.10
+validators==0.22.0
+xarray==2023.12.0
+zarr==2.18.2
+numcodecs==0.12.1
