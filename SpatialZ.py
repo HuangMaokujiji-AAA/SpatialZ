@@ -273,58 +273,49 @@ def perform_microenv_measure(adata1, adata2, adata3, cell_type_key,
     return adata1, adata2, adata3
 
 
-def synthesize_gene_expression(reference_adatas, query_adata, cell_type_key, k_sam, micro_env_key, Beta):
+def synthesize_gene_expression(reference_adatas, query_adata, cell_type_key, k_sam, micro_env_key, Beta,
+                               chunk_size=256):
+    """Same independent per-gene donor sampling, with bounded similarity memory."""
     if micro_env_key not in query_adata.obsm:
         raise ValueError(f"Microenvironment key '{micro_env_key}' is not present in query dataset. Please perform microenvironment measurement calculations first.")
-    
-    combined_adata = reference_adatas[0].concatenate(reference_adatas[1:], batch_key='batch')
-    
-    # Create KD-tree for spatial coordinates
-    kdtree = cKDTree(combined_adata.obsm['spatial'])
-    
-    # Pre-compute cosine similarities
-    cos_similarities = cosine_similarity(combined_adata.obsm[micro_env_key], query_adata.obsm[micro_env_key])
-    
-    # Process each cell in query_adata
-    for i, cell_type in enumerate(query_adata.obs[cell_type_key]):
-        # Filter cells by the same type from combined dataset
-        same_type_mask = combined_adata.obs[cell_type_key] == cell_type
-        same_type_data = combined_adata[same_type_mask]
-        
-        if same_type_data.n_obs > 0:
-            # Query KD-tree for k nearest neighbors
-            #distances, indices = kdtree.query(query_adata.obsm['spatial'][i], k=min(k_sam, same_type_data.n_obs))
-            distances, indices = kdtree.query(query_adata.obsm['spatial'][i], k=min(k_sam, same_type_data.n_obs))
-            indices = np.atleast_1d(indices)  # Ensure that indices is always an array
+    if not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError("chunk_size must be a positive integer")
+    if not isinstance(k_sam, int) or k_sam < 1:
+        raise ValueError("k_sam must be a positive integer")
 
-            
-            # Filter indices to include only cells of the same type
-            valid_indices = indices[same_type_mask[indices]]
-            
-            if len(valid_indices) > 0:
-                # Get pre-computed cosine similarities for valid indices
-                similarities = cos_similarities[valid_indices, i]
-                
-                # Adjust similarities for sampling weights
-                exp_similarities = np.exp(Beta*similarities)
-                weights = exp_similarities / exp_similarities.sum()
-                
-                # Sample gene expressions
-                sampled_expression = np.zeros(query_adata.X[i].shape)
-                for gene_idx in range(sampled_expression.shape[0]):
-                    chosen_cell_idx = np.random.choice(np.arange(len(valid_indices)), p=weights)
-                    sampled_expression[gene_idx] = combined_adata.X[valid_indices[chosen_cell_idx], gene_idx]
-                
-                query_adata.X[i] = sampled_expression
+    combined_adata = reference_adatas[0].concatenate(reference_adatas[1:], batch_key='batch')
+    kdtree = cKDTree(combined_adata.obsm['spatial'])
+    labels = combined_adata.obs[cell_type_key].to_numpy()
+    query_labels = query_adata.obs[cell_type_key].to_numpy()
+    counts = pd.Series(labels).value_counts()
+    gene_indices = np.arange(query_adata.n_vars)
+    for start in range(0, query_adata.n_obs, chunk_size):
+        stop = min(start + chunk_size, query_adata.n_obs)
+        similarities = cosine_similarity(combined_adata.obsm[micro_env_key],
+                                         query_adata.obsm[micro_env_key][start:stop])
+        # Keep the original rule: query globally, then filter for the same type.
+        _, neighbors = kdtree.query(query_adata.obsm['spatial'][start:stop],
+                                    k=min(k_sam, combined_adata.n_obs))
+        if neighbors.ndim == 1:
+            neighbors = neighbors[:, None]
+        for offset, i in enumerate(range(start, stop)):
+            cell_type = query_labels[i]
+            same_count = int(counts.get(cell_type, 0))
+            indices = neighbors[offset, :min(k_sam, same_count)]
+            valid_indices = indices[labels[indices] == cell_type]
+            if len(valid_indices):
+                logits = Beta * similarities[valid_indices, offset]
+                weights = np.exp(logits - logits.max())
+                weights /= weights.sum()
+                chosen = np.random.choice(len(valid_indices), size=query_adata.n_vars, p=weights)
+                values = combined_adata.X[valid_indices[chosen], gene_indices]
+                if isspmatrix(values):
+                    values = values.toarray()
+                query_adata.X[i] = np.asarray(values).ravel()
             else:
                 print(f"No valid cells of the same type found for cell index {i}")
-        else:
-            print(f"No cells of the same type found for cell index {i}")
-
-    # Clear pre-computed cosine similarities to free memory
-    del cos_similarities
-    
     return query_adata
+
 
 def synthesize_gene_expression_fast(reference_adatas, query_adata, cell_type_key, k_sam):
     combined_adata = reference_adatas[0].concatenate(reference_adatas[1:], batch_key='batch')

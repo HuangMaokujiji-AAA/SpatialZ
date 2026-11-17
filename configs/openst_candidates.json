@@ -1,0 +1,5 @@
+[
+  {"iterations": 1000, "lr": 100000, "projections": 80, "k_sam": 50, "beta": 1, "syn_mode": "default"},
+  {"iterations": 2000, "lr": 100000, "projections": 80, "k_sam": 50, "beta": 1, "syn_mode": "default"},
+  {"iterations": 1000, "lr": 100000, "projections": 80, "k_sam": 50, "beta": 5, "syn_mode": "default"}
+]
