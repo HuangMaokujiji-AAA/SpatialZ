@@ -141,7 +141,7 @@ class IntegrationTests(unittest.TestCase):
             def backend(device, jobs):
                 yield generate, SimpleNamespace(manual_seed=lambda s: None), 'cpu'
 
-            argv = ['--input', str(source), '--output', str(output), '--core-um', '10',
+            argv = ['--stage', 'all', '--input', str(source), '--output', str(output), '--core-um', '10',
                     '--halo-um', '2', '--candidates', str(candidates), '--eval-projections', '4']
             with patch.object(runner, 'generation_backend', backend), patch.object(runner.OpenST, 'section', read):
                 runner.main(argv)
@@ -173,9 +173,55 @@ class IntegrationTests(unittest.TestCase):
                     runner.main(argv + ['--candidates', str(other)])
                 self.assertEqual(events, [])
                 with self.assertRaisesRegex(ValueError, 'frozen validation'):
-                    runner.main(argv + ['--stage', 'test', '--seed', '43'])
+                    runner.main(['--stage', 'selected-test', '--input', str(source),
+                                 '--output', str(output), '--core-um', '10', '--halo-um', '2',
+                                 '--eval-projections', '4', '--seed', '43'])
                 with self.assertRaisesRegex(ValueError, 'protocol changed'):
                     runner.main(argv + ['--halo-um', '3'])
+
+    def test_default_directly_reconstructs_test_slices_without_validation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, output = Path(temp) / 'input.h5ad', Path(temp) / 'direct'
+            self.fixture(source)
+            original = runner.OpenST.section
+            reads = []
+
+            def read(data, section, track):
+                self.assertNotIn(section, runner.VALIDATION)
+                reads.append((section, track))
+                if section in runner.TEST:
+                    self.assertTrue((output / f'track{track}/test/section_{section}/generated.h5ad').is_file())
+                return original(data, section, track)
+
+            def generate(a, b, **p):
+                self.assertEqual(p['nb_iter_max'], runner.DEFAULT_PARAMETERS['iterations'])
+                self.assertEqual(p['Beta'], runner.DEFAULT_PARAMETERS['beta'])
+                combined = ad.concat([a, b])
+                return combined[np.linspace(0, combined.n_obs - 1, p['n_cell'], dtype=int)].copy()
+
+            @contextmanager
+            def backend(device, jobs):
+                yield generate, SimpleNamespace(manual_seed=lambda s: None), 'cpu'
+
+            argv = ['--input', str(source), '--output', str(output), '--core-um', '10',
+                    '--halo-um', '2', '--eval-projections', '4']
+            with patch.object(runner, 'generation_backend', backend), \
+                    patch.object(runner.OpenST, 'section', read), \
+                    patch.object(runner, 'run_validation', side_effect=AssertionError('No validation allowed')):
+                # An existing selection file must not affect the fixed baseline.
+                output.mkdir()
+                (output / 'selection.json').write_text('not used by direct mode')
+                runner.main(argv)
+                self.assertEqual({s for s, _ in reads if s in runner.TEST}, set(runner.TEST))
+                self.assertEqual(sum(s in runner.TEST for s, _ in reads), 8)
+                settings = json.loads((output / 'test_parameters.json').read_text())
+                self.assertEqual(settings['parameter_source'], 'fixed_defaults')
+                self.assertFalse((output / 'track1/validation').exists())
+                self.assertFalse((output / 'validation_scores.csv').exists())
+                self.assertEqual(len(pd.read_csv(output / 'test_summary.csv')), 24)
+                reads.clear()
+                runner.main(argv)
+                self.assertEqual(reads, [])
 
     def test_empty_tiles_and_single_endpoint_fallback_resume(self):
         def endpoint(x):

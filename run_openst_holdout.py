@@ -1,7 +1,8 @@
-"""Open-ST GSE251926: prepare, select on validation slices, then test SpatialZ.
+"""Open-ST GSE251926: directly reconstruct four test slices with fixed SpatialZ parameters.
 
 No flow-matching or RARS model is implemented by SpatialZ. Their observation
 pairs and pseudo-holdouts are exported as protocol metadata, not trained here.
+Validation-based parameter selection is optional (--stage all).
 """
 
 import argparse
@@ -453,17 +454,26 @@ def run_validation(data, protocol, candidates, args, backend):
 
 
 def run_test(data, protocol, selection, args, backend):
-    if (selection['seed'] != args.seed or selection['eval_projections'] != args.eval_projections
-            or selection['mender_jobs'] != args.mender_jobs):
-        raise ValueError('Seed, MENDER jobs and evaluation projections must match frozen validation')
-    if any(str(t) not in selection['tracks'] for t in args.tracks):
-        raise ValueError('Requested track has no frozen validation selection')
+    if selection is not None:
+        if (selection['seed'] != args.seed or selection['eval_projections'] != args.eval_projections
+                or selection['mender_jobs'] != args.mender_jobs):
+            raise ValueError('Seed, MENDER jobs and evaluation projections must match frozen validation')
+        if any(str(t) not in selection['tracks'] for t in args.tracks):
+            raise ValueError('Requested track has no frozen validation selection')
+    settings = dict(parameter_source='fixed_defaults' if selection is None else 'validation_selection',
+                    parameters_by_track={str(t): (DEFAULT_PARAMETERS if selection is None
+                        else selection['tracks'][str(t)]['parameters']) for t in args.tracks},
+                    seed=args.seed, eval_projections=args.eval_projections, mender_jobs=args.mender_jobs)
+    path = args.output / 'test_parameters.json'
+    if path.exists() and json.loads(path.read_text()) != settings:
+        raise ValueError('Test parameters or their source changed; use a new output directory')
+    write_json(path, settings)
     rows = []
     for track in args.tracks:
-        chosen = selection['tracks'][str(track)]
+        parameters = settings['parameters_by_track'][str(track)]
         for task in protocol['test']:
             directory = args.output / f'track{track}' / 'test' / f"section_{task['target']}"
-            metrics = run_task(data, task, track, protocol, chosen['parameters'], args, directory, backend)
+            metrics = run_task(data, task, track, protocol, parameters, args, directory, backend)
             for name, values in metrics['comparisons'].items():
                 rows.append(dict(track=track, target=task['target'], comparison=name,
                                  fallback_cells=metrics['fallback_cells'], **values))
@@ -479,7 +489,9 @@ def main(argv=None):
     parser.add_argument('--input', type=Path, default=DEFAULT_INPUT,
                         help='Default: data/Open-ST/GSE251926_metastatic_lymph_node_3d.h5ad relative to this script')
     parser.add_argument('--output', type=Path, default=Path(__file__).resolve().parent / 'output/openst_holdout')
-    parser.add_argument('--stage', choices=['prepare', 'validate', 'test', 'all'], default='all')
+    parser.add_argument('--stage', choices=['prepare', 'validate', 'test', 'selected-test', 'all'],
+                        default='test', help='test (default): fixed parameters, no validation; '
+                        'all: validate then test; selected-test: reuse frozen validation selection')
     parser.add_argument('--candidates', type=Path, help='JSON list of validation-only hyperparameter candidates')
     parser.add_argument('--tracks', type=int, nargs='+', choices=[1, 2], default=[1, 2])
     parser.add_argument('--device', default='auto')
@@ -501,6 +513,9 @@ def main(argv=None):
         parser.error('Invalid seed, worker count, projection count, coordinate scale or tile dimensions')
     if len(set(args.tracks)) != len(args.tracks):
         parser.error('Do not repeat tracks')
+    if args.candidates is not None and args.stage in ('test', 'selected-test'):
+        parser.error('--candidates is for --stage validate or --stage all; '
+                     'omit it for direct fixed-parameter testing')
     for key in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
         os.environ.setdefault(key, str(args.mender_jobs))
     candidates = parameters_from_file(args.candidates)
@@ -520,16 +535,20 @@ def main(argv=None):
               f"{len(protocol['tiles'])} columns. Output: {args.output}", flush=True)
         if args.stage == 'prepare':
             return
-        if args.stage == 'test' and not (args.output / 'selection.json').exists():
-            raise ValueError('Run --stage validate first; test requires frozen selection.json')
+        if args.stage == 'selected-test' and not (args.output / 'selection.json').exists():
+            raise ValueError('Run --stage validate first; selected-test requires frozen selection.json')
         with generation_backend(args.device, args.mender_jobs) as backend:
             environment = {d.metadata['Name']: d.version for d in distributions() if d.metadata['Name']}
             write_json(args.output / 'environment.json', environment)
-            if args.stage in ('validate', 'all'):
+            if args.stage == 'test':
+                selection = None
+                print('Direct SpatialZ baseline: fixed parameters, four test slices per track; '
+                      'no validation selection or model training.', flush=True)
+            elif args.stage in ('validate', 'all'):
                 selection = run_validation(data, protocol, candidates, args, backend)
             else:
                 selection = json.loads((args.output / 'selection.json').read_text())
-            if args.stage in ('test', 'all'):
+            if args.stage in ('test', 'selected-test', 'all'):
                 run_test(data, protocol, selection, args, backend)
     finally:
         data.close()

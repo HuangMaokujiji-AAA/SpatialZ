@@ -237,28 +237,48 @@ Scanpy 1.10.3 / Numba 0.59 服务器环境补包，先保存全部已安装版�
 结果验证。若约束冲突，安装器会报错而不会自动降级已有包；独立重跑检查可用
 `python scripts/check_openst_dependencies.py`。
 
-以下命令对两个轨道、两个验证片运行三组候选参数，再锁定每轨道最优配置，
-最后生成和评估四个测试片：
+**默认直接验证 SpatialZ 基线，不训练、不搜索超参数。** 固定参数为
+`iterations=1000`、`lr=1e5`、80 个投影、`k_sam=50`、`Beta=1`、
+`syn_mode=default`。下面的命令仅用各测试片指定的两个端点，直接生成和评估
+四张测试片；默认执行两个轨道，共 8 次整片重建，不重建 #6、#34：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
   --device cuda:0 --mender-jobs 2 \
-  --candidates configs/openst_candidates.json \
-  --output output/openst_holdout
+  --output output/openst_direct
 ```
 
-也可分为 `--stage validate` 与 `--stage test` 两次运行，保持相同路径和配置。
-`test` 必须读取已经保存的 `selection.json`；只有 #6、#34 参与选型。
-不传 `--candidates` 时仅评估默认的一组参数，不构成超参数搜索。
-SpatialZ 没有跨数据集训练的 epoch，不能实现神经网络式早停；这里把优化迭代
-预算作为验证超参数，选择标准预先固定为两张验证片等权平均的：
+`--stage test` 是默认阶段，不要求也不读取 `selection.json`。
+日志中的坐标迭代是每次重建内部的 Wasserstein 重心求解，不是模型训练；
+MENDER 也是对本次输入/生成片计算微环境表征，没有跨样本学习的权重。
+Core/Halo 分块、坐标优化和逐基因表达合成仍需计算时间。
+若旧命令正在重建 #6，可以用 Ctrl+C 停止后运行上述直接测试命令。
+旧选参目录的结果可保留，使用新的 `output/openst_direct` 避免混淆。
+
+只有需要额外比较超参数时，才显式运行以下可选流程：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
+  --stage all --device cuda:0 --mender-jobs 2 \
+  --candidates configs/openst_candidates.json \
+  --output output/openst_tuned
+```
+
+该可选命令对两个轨道、两个验证片运行三组候选参数，再锁定每轨道最优配置，
+最后评估四个测试片。也可分为 `--stage validate` 与 `--stage selected-test`
+两次运行，保持相同路径、种子和配置。`selected-test` 必须读取已保存的
+`selection.json`；只有 #6、#34 参与选型。固定参数的直接 `test` 阶段不接受
+`--candidates`，以免误以为进行了选参。
+SpatialZ 没有跨数据集训练的 epoch，不能实现神经网络式早停；可选搜索仅将
+重建优化迭代预算等参数作为超参数，选择标准预先固定为两张验证片等权平均的：
 
 ```text
 空间 SW1(μm) / core_um + 细胞类型总变差 + 基因均值 MAE / 真实片全局表达均值
 ```
 
-输出包括 `protocol.json`、四份划分 CSV、`validation_scores.csv`、冻结的
-`selection.json`、`test_summary.csv` 和四个测试片等权的 `test_macro.csv`。
+默认输出包括 `protocol.json`、四份划分 CSV、记录参数来源的
+`test_parameters.json`、`test_summary.csv` 和四个测试片等权的 `test_macro.csv`。
+可选选参流程还会生成 `validation_scores.csv` 和冻结的 `selection.json`。
 各轨道各切片目录保存 `generated.h5ad`、逐 Tile 检查点、`tiles.csv`、
 `metrics.json`、逐基因与逐细胞类型 CSV、任务配置和运行状态。
 指标覆盖空间 SW1/双向最近邻距离、类型比例总变差、细胞数误差、表达均值相关性
