@@ -168,156 +168,121 @@ python -m unittest discover -s tests -v
 These checks test held-out isolation, metric probability normalization and
 artifact creation with a mocked generator; they do not measure method accuracy.
 
-# 5 Open-ST 淋巴结留出验证（GSE251926）
+# 5 Open-ST 淋巴结留出验证：精细注释 + Seurat HVG2000
 
-`run_openst_holdout.py` 使用本地完整 H5AD 的 `obs['n_section']` 物理编号、
-`obs['annotation']` 注释、`obsm['spatial_3d_aligned']` 的已配准 XYZ，以及
-现有 `X` 表达值。**不使用未配准的 `obsm['spatial']`，不重新归一化，不读取
-`layers['raw']`，不使用留出片进行配准或基因选择。**
+`run_openst_holdout.py` 现在只使用原 Track 1 的精细注释，不再划分两个 Track。
+保留 `Tumor_Keratin_Pearl`、`Plasma_IgA`、`Plasma_IgG` 和
+`Germinal_Center_Plasma_IgM_B_cell` 等原始标签，不合并为粗类。
 
-| 用途 | 物理切片 | 生成时可见的端点 |
+输入为项目目录下的 `data/Open-ST/GSE251926_metastatic_lymph_node_3d.h5ad`。
+使用 `obs['n_section']` 物理编号、`obs['annotation']` 注释、
+`obsm['spatial_3d_aligned']` 的已配准 XYZ 和现有 `X` 表达值。
+`X` 已经过 log1p 处理，脚本要求保留 `uns['log1p']` 元数据，不重复归一化或取对数，
+不读取 `layers['raw']`，不使用未配准的 `obsm['spatial']`。
+
+| 用途 | 物理切片 | 重建端点 |
 | --- | --- | --- |
 | 测试 | #4、#18、#24、#9 | #3/#5、#17/#19、#23/#25、#7/#11 |
-| 验证 | #6、#34 | #5/#7、#33/#36 |
-| 可见训练观测 | #2、#3、#5、#7、#11、#17、#19、#23、#25、#26、#28、#33、#36 | 仅以上 13 片 |
+| 验证（可选选参） | #6、#34 | #5/#7、#33/#36 |
+| 可见训练观测及 HVG 拟合 | #2、#3、#5、#7、#11、#17、#19、#23、#25、#26、#28、#33、#36 | 仅这 13 片 |
 
-SpatialZ 是逐对切片求 Wasserstein 重心的基线，仓库没有流匹配网络或 RARS 门控。
-脚本导出 12 组相邻**可见观测**对（不代表物理编号连续）和 11 组可见观测的
-相邻三元组，包含 `#2/#3/#5`、`#23/#25/#26`，供后续模型使用，
-**不声称执行了流匹配训练或 RARS 训练**。
+第一次运行会合并上述 13 张训练片的稀疏 `X`，按 Scanpy 的 Seurat 方法选基因：
 
-按真实 Z 距离计算 SpatialZ 的左端点权重 `alpha`：#6 为 1/2，#34 为 2/3。
-默认 `--spatial-mode whole` 与 `run_merfish_holdout.py` 一样，对每张目标片只调用
-一次 `Generate_spatialz`，输入为两张完整端点，细胞数取端点整片计数的加权平均，
-不构建 Tile、不裁剪、不读取其他训练片的 XY 来拟合网格。
-
-可选的 `--spatial-mode tiled` 保留最初指定的分块协议：
-XY 使用 1500 × 1500 μm 核心窗口、150 μm Halo；网格原点和范围仅由 13 片
-训练观测确定。每个窗口共用相同 XY 范围贯穿各片，生成时使用扩展窗口，拼接时
-按左闭右开的核心边界裁剪。目标细胞数取端点窗口的加权计数，不读取真实目标片
-计数。如果窗口只有一个非空端点，使用该端点按加权计数重采样，并在
-`generation_method`、`tiles.csv` 和 `fallback_cells` 中明确记录；两端都空则跳过。
-因此裁剪后的整片数量并不强制等于端点加权计数。
-
-Track 1 保留完整细注释。Track 2 **在生成前**执行以下映射，且不会把细标签
-作为额外字段传入模型：
-
-| 文件中的真实标签 | Track 2 输入/输出标签 |
-| --- | --- |
-| `Tumor_Keratin_Pearl`、`Tumor` | `Tumor` |
-| `Germinal_Center_Plasma_IgM_B_cell`、`Plasma_IgA`、`Plasma_IgG` | `Plasma cell` |
-| 其余标签（含 `unknown`） | 原值 |
-
-这里将现有 IgG 主类也统一命名为 `Plasma cell`，以真正形成一个粗粒度 Plasma
-类。Track 2 按粗类评分；从粗标签预测不能宣称恢复了 Keratin pearl 或 IgM/IgA
-亚型身份。Track 1 的各类型指标可以直接检查这些稀有类型。
-
-先检查数据和导出划分（只需 NumPy、Pandas、SciPy、h5py、scikit-learn）：
-
-```bash
-python run_openst_holdout.py --stage prepare
+```python
+sc.pp.highly_variable_genes(
+    training, flavor="seurat", n_top_genes=2000,
+    n_bins=20, batch_key=None, subset=False, inplace=True,
+)
 ```
 
-默认输入为脚本所在项目目录下的
-`data/Open-ST/GSE251926_metastatic_lymph_node_3d.h5ad`，与服务器目录结构一致，
-无需传 `--input`，也不受启动命令所在目录影响。其他数据位置仍可用 `--input` 指定。
-正式运行需要项目原有的 PyTorch、POT、AnnData、Scanpy、SOMENDER 等依赖。
-如果服务器已经具备这些基础数值包，但报 `No module named 'MENDER'`，运行：
+这是对全部可见训练细胞的合并筛选，不是每片分别选基因，也不是
+`flavor='seurat_v3'`。验证片、测试片的表达、XY 和标签不参与 HVG 筛选。
+Scanpy 可能因阈值并列返回超过 2000 个基因；脚本按标准化离散度降序、原始基因
+索引升序打破并列，确保**恰好 2000 个 HVG**。选定后保持原输入列顺序，所有端点、
+预测和真实留出片统一使用这套顺序。输出 `generated.h5ad` 的 `X` 为
+`n_generated_cells × 2000`，不再生成或保存全转录组预测。
+
+HVG 记录保存在输出根目录：
+
+- `hvg_selection.json`：输入指纹、13 张拟合切片、Scanpy 版本、HVG 索引/名称及顺序哈希。
+- `hvg_genes.txt`：按模型实际输入/输出顺序排列的 2000 个基因，可供其他对照方法复用。
+- `hvg_statistics.csv`：全部候选基因的均值、离散度、标准化离散度、选择标记和 HVG 排名。
+
+后续运行复用冻结清单，不重新读取训练表达来拟合 HVG。HVG 拟合本身仍需读取
+训练片的全基因稀疏表达；生成阶段只把选中的 2000 列传入 SpatialZ。
+评分也仅针对相同的 2000 个基因，不能将其称为全转录组表达指标。
+
+SpatialZ 无需训练。默认固定 `iterations=1000`、`lr=1e5`、80 个投影、
+`k_sam=50`、`Beta=1`、`syn_mode=default`，对每张目标片使用两张完整端点，
+调用一次 `Generate_spatialz`。默认只重建四张测试片，不重建 #6、#34。
+目标细胞数取端点的物理距离加权计数，不使用真实目标片计数；预测保存后才读取
+该留出片的表达、XY 和注释进行评分。按实际 Z 计算左端点权重 `alpha`，
+#6 为 1/2，#34 为 2/3。论文中涉及的流匹配/RARS 模型不在本仓库内；
+脚本仍导出 12 组观测对、11 组伪留出三元组清单，但不执行这些模型的训练。
+
+服务器依赖已安装后运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
+  --stage test --spatial-mode whole --device cuda:0 \
+  --output output/openst_hvg2000
+```
+
+仅先准备 HVG 和划分、或只运行一张测试片：
+
+```bash
+python run_openst_holdout.py --stage prepare --output output/openst_hvg2000
+CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
+  --device cuda:0 --targets 4 --output output/openst_hvg2000
+```
+
+旧的 `--tracks` 参数已删除。请使用新的输出目录；旧双 Track/全转录组目录不能续跑
+为 HVG2000 实验。相同新目录支持逐片恢复，输入文件、参数和 HVG 清单必须一致。
+完成单片后再次运行完整命令，会复用该片结果。每次 `test_summary.csv` 与
+`test_macro.csv` 汇总当次请求的目标，`test_scope.json` 记录汇总范围。
+
+单次约 5 万细胞的稠密表达中间矩阵现在约 0.4 GB；坐标优化、微环境和 I/O
+仍有额外开销。输入与最终输出保持 CSR。内存受限时，可使用原分块方案
+`--spatial-mode tiled`：1500 × 1500 μm Core、150 μm Halo，以训练片确定网格，
+生成后裁掉 Halo，单端点非空窗口单独标记重采样来源。
+整片和分块使用不同结果目录。
+
+可选选参仍只使用 #6、#34，且 HVG 继续固定为 13 张训练片拟合的清单：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
+  --stage all --device cuda:0 --candidates configs/openst_candidates.json \
+  --output output/openst_hvg2000_tuned
+```
+
+也可先 `--stage validate`，再 `--stage selected-test`；默认 `--stage test`
+不要求也不读取 `selection.json`。可选选型分数为两张验证片的等权平均：
+`spatial_SW1_um/core_um + cell_type_TV + gene_mean_MAE/real_global_mean`。
+
+生成文件位于 `test/section_4/generated.h5ad` 等目录，附有 `metrics.json`、
+逐 HVG/细胞类型比较 CSV、配置及运行状态；根目录输出 `test_summary.csv` 和
+按测试片等权平均的 `test_macro.csv`。现有指标涵盖空间 SW1、双向最近邻距离、
+细胞类型总变差、计数误差、HVG 表达均值相关性/误差、方差相关性、检测率误差
+和全零表达细胞数，并报告端点与端点加权表达均值基线。
+
+缺少 MENDER 时，使用已有服务器环境的补包脚本：
 
 ```bash
 bash scripts/install_openst_deps.sh
 ```
 
-该安装脚本针对本次提供的 Python 3.10 / NumPy 1.24.4 / SciPy 1.12.0 /
-Scanpy 1.10.3 / Numba 0.59 服务器环境补包，先保存全部已安装版本作为约束，
-按 `requirements-openst-extra.txt` 安装缺失的运行时依赖，再通过 `--no-deps`
-安装 `SOMENDER==1.1`（导入名 `MENDER`）和 `squidpy==1.2.3`。不直接重装
-仓库原始 `requirements.txt`，避免替换已有的 NVIDIA PyTorch 与数值库。
-安装后会运行真实的 POT 优化、MENDER 计算和 8 个模拟细胞的 SpatialZ 生成检查；
-该检查使用 GPU（可用时）或 CPU，不读取真实 Open-ST 数据。
-安装前后版本记录保存在 `output/openst_dependency_setup/`。
+它通过已安装版本快照约束补包，再使用 `--no-deps` 安装 SOMENDER/Squidpy，
+并运行真实小样本生成检查，避免自动替换已有 NVIDIA PyTorch/数值库。
+详见 `requirements-openst-extra.txt`，记录保存在 `output/openst_dependency_setup/`。
 
-这里刻意沿用服务器的现有数值版本，因此不满足 SOMENDER 的全部历史版本声明；
-`pip check` 仍可能提示其精确版本不符。此兼容组合需要以生成检查和正式运行
-结果验证。若约束冲突，安装器会报错而不会自动降级已有包；独立重跑检查可用
-`python scripts/check_openst_dependencies.py`。
-
-**默认直接验证 SpatialZ 基线，不训练、不搜索超参数。** 固定参数为
-`iterations=1000`、`lr=1e5`、80 个投影、`k_sam=50`、`Beta=1`、
-`syn_mode=default`。下面的命令仅用各测试片指定的两个端点，直接生成和评估
-四张测试片；默认执行两个轨道，共 8 次整片重建，不重建 #6、#34：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
-  --spatial-mode whole --device cuda:0 --mender-jobs 2 \
-  --output output/openst_whole
-```
-
-`--stage test` 是默认阶段，不要求也不读取 `selection.json`。
-日志中的坐标迭代是每次重建内部的 Wasserstein 重心求解，不是模型训练；
-MENDER 也是对本次输入/生成片计算微环境表征，没有跨样本学习的权重。
-坐标优化和逐基因表达合成仍需计算时间。整片模式的中间表达矩阵为稠密存储，
-本数据单次输出矩阵约 5.5–6.4 GB，实际峰值还包含端点、采样和 MENDER 中间量；
-读入与最终保存使用 CSR。内存受限时可显式使用 `--spatial-mode tiled`。
-整片重心求解与局部窗口求解的结果不同；两种模式不能混用同一结果目录。
-
-建议先仅运行一张目标片、一个轨道实测时间与内存：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
-  --spatial-mode whole --device cuda:0 --targets 4 --tracks 1 \
-  --output output/openst_whole
-```
-
-随后运行前面的完整命令，已完成的 #4/Track 1 会复用；还可使用 `--targets`
-指定其他测试片组合。每次的 `test_summary.csv`、`test_macro.csv` 只汇总当次请求
-的目标与轨道，并用 `test_scope.json` 记录范围；各切片结果文件持续保留。
-旧进程可用 Ctrl+C 停止后切换到整片模式。之前分块结果保留，继续分块时使用
-`--spatial-mode tiled --output output/openst_direct`；整片使用新的 `output/openst_whole`。
-
-只有需要额外比较超参数时，才显式运行以下可选流程：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -u run_openst_holdout.py \
-  --stage all --device cuda:0 --mender-jobs 2 \
-  --candidates configs/openst_candidates.json \
-  --output output/openst_tuned
-```
-
-该可选命令对两个轨道、两个验证片运行三组候选参数，再锁定每轨道最优配置，
-最后评估四个测试片。也可分为 `--stage validate` 与 `--stage selected-test`
-两次运行，保持相同路径、种子和配置。`selected-test` 必须读取已保存的
-`selection.json`；只有 #6、#34 参与选型。固定参数的直接 `test` 阶段不接受
-`--candidates`，以免误以为进行了选参。
-SpatialZ 没有跨数据集训练的 epoch，不能实现神经网络式早停；可选搜索仅将
-重建优化迭代预算等参数作为超参数，选择标准预先固定为两张验证片等权平均的：
-
-```text
-空间 SW1(μm) / core_um + 细胞类型总变差 + 基因均值 MAE / 真实片全局表达均值
-```
-
-默认输出包括 `protocol.json`、四份划分 CSV、记录参数来源的
-`test_parameters.json`、`test_scope.json`、`test_summary.csv` 和各测试片等权的 `test_macro.csv`。
-可选选参流程还会生成 `validation_scores.csv` 和冻结的 `selection.json`。
-各轨道各切片目录保存 `generated.h5ad`（分块模式另有逐 Tile 检查点和 `tiles.csv`）、
-`metrics.json`、逐基因与逐细胞类型 CSV、任务配置和运行状态。
-指标覆盖空间 SW1/双向最近邻距离、类型比例总变差、细胞数误差、表达均值相关性
-和误差、方差相关性、检测率误差及全零表达细胞数，并同时报告两端点与表达加权
-均值基线。每张预测完整保存后才读取该留出片的表达、XY 和注释。
-
-同一命令可恢复已完成的任务和 Tile。输入文件大小/修改时间、坐标字段、缩放和
-网格配置必须与 `protocol.json` 相同；每个已运行任务的参数、种子和设备也必须
-匹配，否则使用新的 `--output`。正式测试后不要在同一结果目录更换候选参数。
-表达合成仅计算有效近邻候选的余弦相似度、向量化独立逐基因采样，保留原有
-候选邻域和采样规则，避免整片所有参考细胞与生成细胞之间的相似度计算。
-稀疏/稠密输入的采样回归检查与完整命令的模拟生成检查：
+工程检查（不代表完整生物学验证完成）：
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-工程检查不代表真实生物学验证完成。提供文件已经全局处理和配准；此流程隔离
-本次预测的数据访问，但不重新估计上游处理，因此不能证明原始预处理完全无泄漏。
+提供文件已经全局处理和配准；本次流程不使用隐藏表达拟合 HVG，但不重新估计
+上游预处理，因此不能据此证明原始配准与归一化完全无泄漏。
 
 **Reference:** Lin, S., Wang, Z., Cui, Y., Zou, Q., Han, C., Yan, R., … & Yuan, Z. (2024). *Bridging the Dimensional Gap from Planar Spatial Transcriptomics to 3D Cell Atlases*. *bioRxiv*, 2024-12.
 

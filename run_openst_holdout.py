@@ -1,4 +1,4 @@
-"""Open-ST GSE251926: directly reconstruct four test slices with fixed SpatialZ parameters.
+"""Open-ST: fine annotations, training-only Seurat HVG2000, four held-out slices.
 
 No flow-matching or RARS model is implemented by SpatialZ. Their observation
 pairs and pseudo-holdouts are exported as protocol metadata, not trained here.
@@ -7,7 +7,8 @@ Validation-based parameter selection is optional (--stage all).
 
 import argparse
 from contextlib import contextmanager
-from importlib.metadata import distributions
+import hashlib
+from importlib.metadata import distributions, version
 import json
 import os
 from pathlib import Path
@@ -29,10 +30,7 @@ VALIDATION = {6: (5, 7), 34: (33, 36)}
 TRAIN = tuple(s for s in SECTIONS if s not in TEST and s not in VALIDATION)
 DEFAULT_INPUT = (Path(__file__).resolve().parent / 'data' / 'Open-ST'
                  / 'GSE251926_metastatic_lymph_node_3d.h5ad')
-# These are the actual annotation strings in the supplied H5AD.
-COARSE = {'Tumor_Keratin_Pearl': 'Tumor',
-          'Germinal_Center_Plasma_IgM_B_cell': 'Plasma cell',
-          'Plasma_IgA': 'Plasma cell', 'Plasma_IgG': 'Plasma cell'}
+N_HVG = 2000
 DEFAULT_PARAMETERS = dict(iterations=1000, lr=1e5, projections=80,
                           k_sam=50, beta=1., syn_mode='default')
 
@@ -106,9 +104,19 @@ class OpenST:
             if any(self.z[b] <= self.z[a] for a, b in zip(SECTIONS, SECTIONS[1:])):
                 raise ValueError('Physical Z must increase with section number')
             var = f['var']
-            self.genes = read_column(var[var.attrs.get('_index', '_index')], slice(None))
-            if len(set(self.genes)) != len(self.genes):
+            self.all_genes = read_column(var[var.attrs.get('_index', '_index')], slice(None))
+            if len(set(self.all_genes)) != len(self.all_genes):
                 raise ValueError('Gene identifiers must be unique')
+            if 'log1p' not in f['uns']:
+                raise ValueError("Seurat HVG expects log1p-normalized X with uns['log1p'] metadata")
+            base = f['uns/log1p/base'] if 'base' in f['uns/log1p'] else None
+            self.log_base = (None if base is None or base.attrs.get('encoding-type') == 'null'
+                             else float(base[()]))
+            if self.log_base is not None and (not np.isfinite(self.log_base)
+                                              or self.log_base <= 0 or self.log_base == 1):
+                raise ValueError('Invalid log1p base')
+            self.gene_indices = None
+            self.hvg_info = None
         except Exception:
             self.handle.close()
             raise
@@ -122,17 +130,22 @@ class OpenST:
             raise ValueError(f'Nonfinite XY in section #{section}')
         return xy
 
-    def section(self, section, track):
-        from anndata import AnnData
-
-        rows, f = self.rows[section], self.handle
-        x = read_matrix(f['X'], rows)
+    def expression(self, section):
+        x = read_matrix(self.handle['X'], self.rows[section])
         x.sum_duplicates()
         x.eliminate_zeros()
         if not np.isfinite(x.data).all() or (x.data < 0).any():
             raise ValueError('Expected finite, nonnegative expression in X')
+        return x
+
+    def section(self, section):
+        from anndata import AnnData
+
+        if self.gene_indices is None:
+            raise RuntimeError('Select and freeze training-only HVGs before loading model inputs')
+        rows, f = self.rows[section], self.handle
+        x = self.expression(section)[:, self.gene_indices].tocsr()
         labels = read_column(f['obs'][self.annotation_key], rows)
-        labels = track_labels(labels, track)
         obs = pd.DataFrame({'cell_type': pd.Categorical(labels)},
                            index=[f's{section}_r{r}' for r in rows])
         adata = AnnData(X=x, obs=obs, var=pd.DataFrame(index=self.genes))
@@ -140,10 +153,72 @@ class OpenST:
         return adata
 
 
-def track_labels(labels, track):
-    if track not in (1, 2):
-        raise ValueError('Track must be 1 or 2')
-    return np.asarray([COARSE.get(v, v) if track == 2 else v for v in labels])
+def prepare_hvgs(data, output):
+    """Run Scanpy's Seurat selector once on pooled visible training cells only."""
+    stat = data.path.stat()
+    identity = dict(input=dict(path=str(data.path), bytes=stat.st_size, mtime_ns=stat.st_mtime_ns),
+                    training_sections=list(TRAIN), expression='X', flavor='seurat',
+                    n_top_genes=N_HVG, n_bins=20, batch_key=None, log1p_base=data.log_base,
+                    n_input_genes=len(data.all_genes))
+    path = output / 'hvg_selection.json'
+    if path.exists():
+        info = json.loads(path.read_text())
+        if info['fit'] != identity:
+            raise ValueError('HVG input or settings changed; use a new output directory')
+    else:
+        import scanpy as sc
+        from anndata import AnnData
+
+        if len(data.all_genes) < N_HVG:
+            raise ValueError(f'Need at least {N_HVG} input genes')
+        matrices = []
+        for section in TRAIN:
+            print(f'HVG fit: reading visible training section #{section}', flush=True)
+            matrices.append(data.expression(section))
+        x = sparse.vstack(matrices, format='csr')
+        del matrices
+        training = AnnData(X=x, var=pd.DataFrame(index=data.all_genes))
+        del x
+        training.uns['log1p'] = {'base': data.log_base}
+        sc.pp.highly_variable_genes(training, flavor='seurat', n_top_genes=N_HVG,
+                                    n_bins=20, batch_key=None, subset=False, inplace=True)
+        table = training.var.copy()
+        n_fit_cells = training.n_obs
+        del training
+        scores = table['dispersions_norm'].to_numpy(dtype=float)
+        eligible = np.flatnonzero(table['highly_variable'].to_numpy() & np.isfinite(scores))
+        if len(eligible) < N_HVG:
+            raise ValueError(f'Seurat returned only {len(eligible)} finite HVG candidates; need {N_HVG}')
+        # Scanpy can include extra genes tied at its cutoff. Resolve ties by input
+        # gene index to enforce exactly 2000, then preserve original column order.
+        ranked = eligible[np.lexsort((eligible, -scores[eligible]))][:N_HVG]
+        indices = np.sort(ranked)
+        table['highly_variable'] = False
+        table.iloc[indices, table.columns.get_loc('highly_variable')] = True
+        ranks = np.full(len(table), np.nan)
+        ranks[ranked] = np.arange(1, N_HVG + 1)
+        table['hvg_rank'] = ranks
+        table.index.name = 'gene'
+        temporary = output / 'hvg_statistics.csv.tmp'
+        table.to_csv(temporary)
+        temporary.replace(output / 'hvg_statistics.csv')
+        genes = data.all_genes[indices].tolist()
+        digest = hashlib.sha256(json.dumps(genes, ensure_ascii=False).encode()).hexdigest()
+        info = dict(schema=1, fit=identity, scanpy_version=version('scanpy'), n_fit_cells=n_fit_cells,
+                    gene_indices=indices.tolist(), genes=genes, ordered_genes_sha256=digest,
+                    ordering='original input columns; cutoff ties broken by original gene index')
+        write_json(path, info)
+    indices = np.asarray(info['gene_indices'], dtype=int)
+    if (len(indices) != N_HVG or len(np.unique(indices)) != N_HVG
+            or (indices < 0).any() or (indices >= len(data.all_genes)).any()
+            or not np.array_equal(data.all_genes[indices], info['genes'])
+            or hashlib.sha256(json.dumps(info['genes'], ensure_ascii=False).encode()).hexdigest()
+               != info['ordered_genes_sha256']):
+        raise ValueError('Invalid frozen HVG panel')
+    data.gene_indices, data.genes, data.hvg_info = indices, data.all_genes[indices], info
+    (output / 'hvg_genes.txt').write_text('\n'.join(info['genes']) + '\n', encoding='utf-8')
+    print(f'Frozen {N_HVG} Seurat HVGs from {info["n_fit_cells"]:,} training cells.', flush=True)
+    return info
 
 
 def triplet(left, target, right, z):
@@ -178,7 +253,7 @@ def make_protocol(data, args):
                 tiles.append(dict(id=len(tiles), bounds=[float(x0), float(y0),
                                                         float(x0 + args.core_um), float(y0 + args.core_um)]))
     stat = data.path.stat()
-    return dict(schema=1, method='SpatialZ baseline (no flow matching or RARS)',
+    return dict(schema=2, method='SpatialZ baseline (no flow matching or RARS)',
                 input=dict(path=str(data.path), bytes=stat.st_size, mtime_ns=stat.st_mtime_ns),
                 fields=dict(section=data.section_key, annotation=data.annotation_key,
                             spatial=data.spatial_key, expression='X'),
@@ -193,7 +268,8 @@ def make_protocol(data, args):
                                  for a, t, b in zip(TRAIN, TRAIN[1:], TRAIN[2:])],
                 spatial_mode=mode, core_um=args.core_um, halo_um=args.halo_um,
                 grid_origin_um=None if origin is None else origin.tolist(),
-                grid_shape=shape, tiles=tiles, track2_mapping=COARSE,
+                grid_shape=shape, tiles=tiles, annotation_mode='fine (former Track 1)',
+                hvg=data.hvg_info,
                 upstream_note='The supplied globally aligned/processed file is used as-is; '
                               'upstream registration/normalization leakage is not re-estimated.')
 
@@ -227,13 +303,13 @@ def generation_backend(device, jobs):
     yield Generate_spatialz, torch, chosen
 
 
-def generate_tiles(data, task, track, protocol, parameters, args, directory, backend):
+def generate_tiles(data, task, protocol, parameters, args, directory, backend):
     """No held-out data access: only the two endpoints enter this function."""
     import anndata as ad
 
     generate, torch, device = backend
     left, right = task['left'], task['right']
-    a, b = data.section(left, track), data.section(right, track)
+    a, b = data.section(left), data.section(right)
     alpha = task['alpha_left']
     pieces, records = [], []
     for tile in protocol['tiles']:
@@ -249,7 +325,7 @@ def generate_tiles(data, task, track, protocol, parameters, args, directory, bac
         masks = [in_box(s.obsm['spatial'], bounds, protocol['halo_um']) for s in (a, b)]
         na, nb = (int(m.sum()) for m in masks)
         n = int(alpha * na + (1 - alpha) * nb)
-        seed = (args.seed + track * 1000003 + task['target'] * 1009 + tile['id']) % (2**32)
+        seed = (args.seed + task['target'] * 1009 + tile['id']) % (2**32)
         record = dict(tile=tile['id'], bounds=bounds, left_cells=na, right_cells=nb,
                       requested_halo_cells=n, kept_cells=0, seed=seed, method='empty')
         if n:
@@ -257,7 +333,7 @@ def generate_tiles(data, task, track, protocol, parameters, args, directory, bac
             torch.manual_seed(seed)
             if na and nb:
                 record['method'] = 'SpatialZ'
-                print(f"Track {track} #{task['target']} tile {tile['id']}: {na}/{nb} -> {n}", flush=True)
+                print(f"Section #{task['target']} tile {tile['id']}: {na}/{nb} -> {n}", flush=True)
                 g = generate(a[masks[0]].copy(), b[masks[1]].copy(),
                              adata1_id=f'left_s{left}', adata2_id=f'right_s{right}',
                              alpha=alpha, device=device, n_cell=n, seed=seed,
@@ -285,12 +361,12 @@ def generate_tiles(data, task, track, protocol, parameters, args, directory, bac
                 g.X.eliminate_zeros()
                 if not np.isfinite(g.X.data).all() or (g.X.data < 0).any():
                     raise ValueError('Generator returned invalid expression')
-                # Drop MENDER representations and retain only the declared track labels.
+                # Drop MENDER representations and retain fine cell annotations.
                 g = ad.AnnData(X=g.X, obs=pd.DataFrame({
                     'cell_type': pd.Categorical(g.obs['cell_type'].astype(str).to_numpy()),
                     'tile_id': tile['id'], 'generation_method': record['method'],
-                    'section': task['target'], 'track': track, 'data_type': 'synthetic'},
-                    index=[f"t{track}_s{task['target']}_tile{tile['id']}_c{i}" for i in range(g.n_obs)]),
+                    'section': task['target'], 'data_type': 'synthetic'},
+                    index=[f"s{task['target']}_tile{tile['id']}_c{i}" for i in range(g.n_obs)]),
                     var=pd.DataFrame(index=data.genes), obsm={'spatial': g.obsm['spatial'].copy()})
                 xyz = np.column_stack((g.obsm['spatial'], np.full(g.n_obs, data.z[task['target']])))
                 g.obsm['spatial_3d_aligned'] = xyz
@@ -303,9 +379,10 @@ def generate_tiles(data, task, track, protocol, parameters, args, directory, bac
         records.append(record)
     if not pieces:
         raise ValueError('No generated core cells; inspect endpoint support and tile parameters')
-    # CSR concatenation keeps whole-slice evaluation sparse (29k genes in this file).
+    # CSR concatenation keeps whole-slice HVG evaluation sparse.
     generated = ad.concat([ad.read_h5ad(p) for p in pieces], join='inner', merge='same')
-    generated.uns['openst_task'] = {**task, 'track': track, 'parameters': parameters}
+    generated.uns['openst_task'] = {**task, 'parameters': parameters,
+                                   'hvg_sha256': data.hvg_info['ordered_genes_sha256']}
     temporary = directory / 'generated.tmp.h5ad'
     generated.write_h5ad(temporary)
     temporary.replace(directory / 'generated.h5ad')
@@ -313,12 +390,12 @@ def generate_tiles(data, task, track, protocol, parameters, args, directory, bac
     return (a, b), generated, records
 
 
-def generate_whole(data, task, track, protocol, parameters, args, directory, backend):
+def generate_whole(data, task, protocol, parameters, args, directory, backend):
     """One call on the two full endpoints, matching the MERFISH runner's workflow."""
     import anndata as ad
 
     generate, torch, device = backend
-    a, b = data.section(task['left'], track), data.section(task['right'], track)
+    a, b = data.section(task['left']), data.section(task['right'])
     path = directory / 'generated.h5ad'
     if path.exists():
         return (a, b), ad.read_h5ad(path), []
@@ -326,7 +403,7 @@ def generate_whole(data, task, track, protocol, parameters, args, directory, bac
     n_cell = int(alpha * a.n_obs + (1 - alpha) * b.n_obs)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    print(f"Track {track} #{task['target']} whole slice: "
+    print(f"Section #{task['target']} whole slice: "
           f"{a.n_obs}/{b.n_obs} -> {n_cell} cells, {a.n_vars} genes", flush=True)
     start = time.perf_counter()
     g = generate(a.copy(), b.copy(), adata1_id=f"left_s{task['left']}",
@@ -348,14 +425,15 @@ def generate_whole(data, task, track, protocol, parameters, args, directory, bac
         raise ValueError('Generator returned invalid expression')
     generated = ad.AnnData(X=g.X, var=pd.DataFrame(index=data.genes),
         obs=pd.DataFrame({'cell_type': pd.Categorical(g.obs['cell_type'].astype(str).to_numpy()),
-                          'section': task['target'], 'track': track, 'data_type': 'synthetic',
+                          'section': task['target'], 'data_type': 'synthetic',
                           'generation_method': 'SpatialZ_whole'},
-                         index=[f"t{track}_s{task['target']}_c{i}" for i in range(n_cell)]),
+                         index=[f"s{task['target']}_c{i}" for i in range(n_cell)]),
         obsm={'spatial': xy.copy(), 'spatial_3d_aligned':
               np.column_stack((xy, np.full(n_cell, data.z[task['target']])))})
     del g
-    generated.uns['openst_task'] = {**task, 'track': track, 'parameters': parameters,
-                                   'spatial_mode': 'whole'}
+    generated.uns['openst_task'] = {**task, 'parameters': parameters,
+                                   'spatial_mode': 'whole',
+                                   'hvg_sha256': data.hvg_info['ordered_genes_sha256']}
     temporary = directory / 'generated.tmp.h5ad'
     generated.write_h5ad(temporary)
     temporary.replace(path)
@@ -435,14 +513,15 @@ def evaluate(sources, generated, real, records, directory, args):
                    empty_tiles=sum(r['requested_halo_cells'] == 0 for r in records),
                    notes=['Unpaired distribution metrics; no cell identity correspondence.',
                           'Spatial distances are in micrometers; probability mass is normalized per slice.',
-                          'Expression is supplied X; no fitted normalization or selected genes.',
-                          'Track 2 scores use coarse labels; fine identities cannot be recovered from coarse outputs.'])
+                          'Expression is supplied log1p X restricted to training-only Seurat HVGs.',
+                          'Fine cell annotations are retained; expression metrics use the frozen HVG panel.'])
     return metrics
 
 
-def run_task(data, task, track, protocol, parameters, args, directory, backend):
+def run_task(data, task, protocol, parameters, args, directory, backend):
     directory.mkdir(parents=True, exist_ok=True)
-    identity = dict(task=task, track=track, parameters=parameters, seed=args.seed,
+    identity = dict(task=task, parameters=parameters, seed=args.seed,
+                    hvg_sha256=data.hvg_info['ordered_genes_sha256'],
                     device=backend[2], mender_jobs=args.mender_jobs,
                     eval_projections=args.eval_projections, spatial_mode=args.spatial_mode)
     identity_path = directory / 'task.json'
@@ -459,12 +538,12 @@ def run_task(data, task, track, protocol, parameters, args, directory, backend):
     report = dict(status='running', **identity)
     try:
         generator = generate_whole if args.spatial_mode == 'whole' else generate_tiles
-        sources, generated, records = generator(data, task, track, protocol, parameters,
+        sources, generated, records = generator(data, task, protocol, parameters,
                                                 args, directory, backend)
         # Prediction has been persisted before the held-out expression/XY/labels are read.
         report.update(stage='evaluating')
         write_json(directory / 'run.json', report)
-        real = data.section(task['target'], track)
+        real = data.section(task['target'])
         metrics = evaluate(sources, generated, real, records, directory, args)
         write_json(metrics_path, metrics)
         report.update(status='complete')
@@ -479,32 +558,27 @@ def run_task(data, task, track, protocol, parameters, args, directory, backend):
 
 def run_validation(data, protocol, candidates, args, backend):
     path = args.output / 'selection.json'
+    frozen_settings = dict(seed=args.seed, candidates=candidates,
+                           eval_projections=args.eval_projections, mender_jobs=args.mender_jobs,
+                           hvg_sha256=data.hvg_info['ordered_genes_sha256'])
     if path.exists():
         frozen = json.loads(path.read_text())
-        if (frozen['candidates'] != candidates or frozen['seed'] != args.seed
-                or frozen['eval_projections'] != args.eval_projections
-                or frozen['mender_jobs'] != args.mender_jobs
-                or set(frozen['tracks']) != {str(t) for t in args.tracks}):
+        if frozen['settings'] != frozen_settings:
             raise ValueError('Selection is already frozen; use a new output directory')
         return frozen
-    rows, selected = [], {}
-    # Select independently per track; all candidates see only #6 and #34.
-    for track in args.tracks:
-        scores = []
-        for i, parameters in enumerate(candidates):
-            values = []
-            for task in protocol['validation']:
-                directory = args.output / f'track{track}' / 'validation' / f'candidate_{i:03d}' / f"section_{task['target']}"
-                metrics = run_task(data, task, track, protocol, parameters, args, directory, backend)
-                values.append(metrics['selection_score'])
-                rows.append(dict(track=track, candidate=i, target=task['target'], score=values[-1]))
-            scores.append(float(np.mean(values)))
-        best = int(np.argmin(scores))
-        selected[str(track)] = dict(candidate=best, parameters=candidates[best],
-                                     validation_score=scores[best])
+    rows, scores = [], []
+    for i, parameters in enumerate(candidates):
+        values = []
+        for task in protocol['validation']:
+            directory = args.output / 'validation' / f'candidate_{i:03d}' / f"section_{task['target']}"
+            metrics = run_task(data, task, protocol, parameters, args, directory, backend)
+            values.append(metrics['selection_score'])
+            rows.append(dict(candidate=i, target=task['target'], score=values[-1]))
+        scores.append(float(np.mean(values)))
+    best = int(np.argmin(scores))
     pd.DataFrame(rows).to_csv(args.output / 'validation_scores.csv', index=False)
-    selection = dict(schema=1, seed=args.seed, tracks=selected, candidates=candidates,
-                     eval_projections=args.eval_projections, mender_jobs=args.mender_jobs,
+    selection = dict(schema=2, settings=frozen_settings, candidate=best,
+                     parameters=candidates[best], validation_score=scores[best],
                      selection_rule='mean over #6/#34 of spatial_SW1_um/core_um + '
                                     'cell_type_TV + gene_mean_MAE/real_global_mean',
                      early_stopping='SpatialZ has no learned epochs; iteration budget is a candidate hyperparameter.')
@@ -514,54 +588,44 @@ def run_validation(data, protocol, candidates, args, backend):
 
 def run_test(data, protocol, selection, args, backend):
     if selection is not None:
-        if (selection['seed'] != args.seed or selection['eval_projections'] != args.eval_projections
-                or selection['mender_jobs'] != args.mender_jobs):
-            raise ValueError('Seed, MENDER jobs and evaluation projections must match frozen validation')
-        if any(str(t) not in selection['tracks'] for t in args.tracks):
-            raise ValueError('Requested track has no frozen validation selection')
+        frozen = selection['settings']
+        if (frozen['seed'] != args.seed or frozen['eval_projections'] != args.eval_projections
+                or frozen['mender_jobs'] != args.mender_jobs
+                or frozen['hvg_sha256'] != data.hvg_info['ordered_genes_sha256']):
+            raise ValueError('Test settings must match frozen validation')
+    parameters = DEFAULT_PARAMETERS if selection is None else selection['parameters']
     settings = dict(parameter_source='fixed_defaults' if selection is None else 'validation_selection',
-                    parameters_by_track={str(t): (DEFAULT_PARAMETERS if selection is None
-                        else selection['tracks'][str(t)]['parameters']) for t in args.tracks},
-                    seed=args.seed, eval_projections=args.eval_projections, mender_jobs=args.mender_jobs)
+                    parameters=parameters, seed=args.seed, eval_projections=args.eval_projections,
+                    mender_jobs=args.mender_jobs, hvg_sha256=data.hvg_info['ordered_genes_sha256'])
     path = args.output / 'test_parameters.json'
-    if path.exists():
-        saved = json.loads(path.read_text())
-        previous = saved.pop('parameters_by_track')
-        current = {k: v for k, v in settings.items() if k != 'parameters_by_track'}
-        if saved != current or any(t in previous and previous[t] != p
-                                   for t, p in settings['parameters_by_track'].items()):
-            raise ValueError('Test parameters or their source changed; use a new output directory')
-        settings['parameters_by_track'] = {**previous, **settings['parameters_by_track']}
+    if path.exists() and json.loads(path.read_text()) != settings:
+        raise ValueError('Test parameters or their source changed; use a new output directory')
     write_json(path, settings)
     rows = []
-    for track in args.tracks:
-        parameters = settings['parameters_by_track'][str(track)]
-        for task in protocol['test']:
-            if task['target'] not in args.targets:
-                continue
-            directory = args.output / f'track{track}' / 'test' / f"section_{task['target']}"
-            metrics = run_task(data, task, track, protocol, parameters, args, directory, backend)
-            for name, values in metrics['comparisons'].items():
-                rows.append(dict(track=track, target=task['target'], comparison=name,
-                                 fallback_cells=metrics['fallback_cells'], **values))
+    for task in protocol['test']:
+        if task['target'] not in args.targets:
+            continue
+        directory = args.output / 'test' / f"section_{task['target']}"
+        metrics = run_task(data, task, protocol, parameters, args, directory, backend)
+        for name, values in metrics['comparisons'].items():
+            rows.append(dict(target=task['target'], comparison=name,
+                             fallback_cells=metrics['fallback_cells'], **values))
     table = pd.json_normalize(rows)
     table.to_csv(args.output / 'test_summary.csv', index=False)
-    write_json(args.output / 'test_scope.json', dict(tracks=args.tracks, targets=args.targets))
-    # Macro-average sections, not cells: each topology milestone has equal weight.
-    numeric = [c for c in table.select_dtypes(include='number') if c not in ('track', 'target')]
-    table.groupby(['track', 'comparison'])[numeric].mean().to_csv(args.output / 'test_macro.csv')
+    write_json(args.output / 'test_scope.json', dict(targets=args.targets))
+    numeric = [c for c in table.select_dtypes(include='number') if c != 'target']
+    table.groupby('comparison')[numeric].mean().to_csv(args.output / 'test_macro.csv')
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, default=DEFAULT_INPUT,
                         help='Default: data/Open-ST/GSE251926_metastatic_lymph_node_3d.h5ad relative to this script')
-    parser.add_argument('--output', type=Path, default=Path(__file__).resolve().parent / 'output/openst_holdout')
+    parser.add_argument('--output', type=Path, default=Path(__file__).resolve().parent / 'output/openst_hvg2000')
     parser.add_argument('--stage', choices=['prepare', 'validate', 'test', 'selected-test', 'all'],
                         default='test', help='test (default): fixed parameters, no validation; '
                         'all: validate then test; selected-test: reuse frozen validation selection')
     parser.add_argument('--candidates', type=Path, help='JSON list of validation-only hyperparameter candidates')
-    parser.add_argument('--tracks', type=int, nargs='+', choices=[1, 2], default=[1, 2])
     parser.add_argument('--targets', type=int, nargs='+', choices=list(TEST), default=list(TEST),
                         help='Test sections to reconstruct (default: all four); e.g. --targets 4')
     parser.add_argument('--spatial-mode', choices=['whole', 'tiled'], default='whole',
@@ -584,8 +648,6 @@ def main(argv=None):
                        (args.core_um, args.xy_scale, args.z_scale))
             or not np.isfinite(args.halo_um) or args.halo_um < 0):
         parser.error('Invalid seed, worker count, projection count, coordinate scale or tile dimensions')
-    if len(set(args.tracks)) != len(args.tracks):
-        parser.error('Do not repeat tracks')
     if len(set(args.targets)) != len(args.targets):
         parser.error('Do not repeat targets')
     if args.candidates is not None and args.stage in ('test', 'selected-test'):
@@ -598,9 +660,12 @@ def main(argv=None):
     data = OpenST(args.input, args.section_key, args.annotation_key, args.spatial_key,
                   args.xy_scale, args.z_scale)
     try:
-        protocol = make_protocol(data, args)
         args.output.mkdir(parents=True, exist_ok=True)
         path = args.output / 'protocol.json'
+        if path.exists() and json.loads(path.read_text()).get('schema') != 2:
+            raise ValueError('Old full-transcriptome/Track results cannot be reused; use a new output directory')
+        prepare_hvgs(data, args.output)
+        protocol = make_protocol(data, args)
         if path.exists():
             saved = json.loads(path.read_text())
             saved.setdefault('spatial_mode', 'tiled')
@@ -621,7 +686,7 @@ def main(argv=None):
             if args.stage == 'test':
                 selection = None
                 print(f'Direct SpatialZ baseline: fixed parameters, targets={args.targets}, '
-                      f'tracks={args.tracks}; no validation selection or model training.', flush=True)
+                      f'{N_HVG} HVGs, fine annotations; no validation selection or model training.', flush=True)
             elif args.stage in ('validate', 'all'):
                 selection = run_validation(data, protocol, candidates, args, backend)
             else:
